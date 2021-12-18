@@ -9,7 +9,7 @@ Tested on Ubuntu 20.04.2 LTS for Raspberry Pi 4 Model B with external HDD.
 1. create new directory in a desired location (the drive needs to have a lot of free space as your movies and TV shows collection will be saved there), e.g. `mkdir /media/exdrive/media_server`
 2. copy `docker-compose.yml` file there, e.g. `cp docker-compose.yml /media/exdrive/media_server`
 3. create new file `.env` in that directory and fill it using `.env.sample` as a template
-4. update line `cd /media/exdrive/media_server` in `media_server.service` file with your location, put it in `/usr/bin` and make it executable using `sudo chmod +x /usr/bin/media_server.sh`
+4. update line `cd /media/exdrive/media_server` in `media_server.sh` file with your location, put it in `/usr/bin` and make it executable using `sudo chmod +x /usr/bin/media_server.sh`
 5. put `media_server.service` file in `/etc/systemd/system` directory, update permissions using `sudo chmod 644 /etc/systemd/system/media_server.service`
 6. check service status using `systemctl status media_server`, enable with `systemctl enable media_server` and reload systemd manager configuration with command `systemctl daemon-reload`
 7. (optional) update crontab to restart media server every day at 4 AM to get docker image updates (`sudo crontab -e` and add the line `0 4   *   *   *    sudo systemctl restart media_server`)
