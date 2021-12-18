@@ -2,7 +2,7 @@ version: "3.6"
 services:
   bazarr:
     container_name: bazarr
-    image: linuxserver/bazarr
+    image: cr.hotio.dev/hotio/bazarr
     ports:
       - 6767:6767
     restart: unless-stopped
@@ -12,7 +12,7 @@ services:
       - ./data/tv:/tv
   jackett:
     container_name: jackett
-    image: linuxserver/jackett
+    image: cr.hotio.dev/hotio/jackett
     ports:
       - 9117:9117
     restart: unless-stopped
@@ -21,7 +21,7 @@ services:
       - ./data/downloads:/downloads
   plex:
     container_name: plex
-    image: maxlbch/pms-docker
+    image: cr.hotio.dev/hotio/plex
     ports:
       - 32400:32400/tcp
       - 3005:3005/tcp
@@ -37,9 +37,20 @@ services:
       - ./plex/config:/config
       - ./plex/transcode:/transcode
       - ./data:/data
+  qbittorrent:
+    container_name: qbittorrent
+    image: cr.hotio.dev/hotio/qbittorrent
+    ports:
+      - 8080:8080
+      - 51413:51413
+      - 51413:51413/udp
+    restart: unless-stopped
+    volumes:
+      - ./qbittorent/config:/config
+      - ./data/downloads:/downloads
   radarr:
     container_name: radarr
-    image: linuxserver/radarr
+    image: cr.hotio.dev/hotio/radarr
     ports:
       - 7878:7878
     restart: unless-stopped
@@ -49,7 +60,7 @@ services:
       - ./data/movies:/movies
   sonarr:
     container_name: sonarr
-    image: linuxserver/sonarr
+    image: cr.hotio.dev/hotio/sonarr
     ports:
       - 8989:8989
     restart: unless-stopped
@@ -57,15 +68,3 @@ services:
       - ./sonarr/config:/config
       - ./data/downloads:/downloads
       - ./data/tv:/tv
-  transmission:
-    container_name: transmission
-    image: linuxserver/transmission
-    ports:
-      - 9091:9091
-      - 51413:51413
-      - 51413:51413/udp
-    restart: unless-stopped
-    volumes:
-      - ./transmission/config:/config
-      - ./transmission/watch:/watch
-      - ./data/downloads:/downloads

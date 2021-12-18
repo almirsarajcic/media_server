@@ -2,7 +2,7 @@
 /data
 /jackett
 /plex
+/qbittorrent
 /radarr
 /sonarr
-/transmission
 .env

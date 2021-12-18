@@ -1,8 +1,8 @@
 # Media server setup
 
-Composition of docker images consisting of [Plex](https://www.plex.tv) for video streaming, [Transmission](https://transmissionbt.com) as a BitTorrent client of choice, collection managers [Sonarr](https://sonarr.tv) for TV shows and [Radarr](https://radarr.video) for movies, [Jackett](https://github.com/Jackett/Jackett) as a proxy between Sonarr, Radarr and various torrent trackers and [Bazarr](https://www.bazarr.media/) for subtitles, all working together to make your home media center setup easier.
+Composition of docker images consisting of [Plex](https://www.plex.tv) for video streaming, [qBittorent](https://www.qbittorrent.org) as a BitTorrent client of choice, collection managers [Sonarr](https://sonarr.tv) for TV shows and [Radarr](https://radarr.video) for movies, [Jackett](https://github.com/Jackett/Jackett) as a proxy between Sonarr, Radarr and various torrent trackers and [Bazarr](https://www.bazarr.media/) for subtitles, all working together to make your home media center setup easier.
 
-Tested on Ubuntu 20.04.2 LTS for Raspberry Pi 4 Model B with external HDD.
+Tested on Ubuntu 21.10 for Raspberry Pi 4 Model B with external HDD.
 
 ## Setup
 
@@ -13,8 +13,8 @@ Tested on Ubuntu 20.04.2 LTS for Raspberry Pi 4 Model B with external HDD.
 5. put `media_server.service` file in `/etc/systemd/system` directory, update permissions using `sudo chmod 644 /etc/systemd/system/media_server.service`
 6. check service status using `systemctl status media_server`, enable with `systemctl enable media_server` and reload systemd manager configuration with command `systemctl daemon-reload`
 7. (optional) update crontab to restart media server every day at 4 AM to get docker image updates (`sudo crontab -e` and add the line `0 4   *   *   *    sudo systemctl restart media_server`)
-8. visit each service's web address to configure it
-9. enjoy
+8. start the service using `systemctl start media_server`
+9. visit each service's web address to configure it
 
 ## Web Addresses
 
@@ -23,6 +23,6 @@ All the services can be accessed using your IP address and their port. Ports can
 - Bazarr http://localhost:6767
 - Jackett http://localhost:9117
 - Plex http://localhost:32400
+- qBittorrent http://localhost:8080 (username: admin, password: adminadmin)
 - Radarr http://localhost:7878
 - Sonarr http://localhost:8989
-- Transmission http://localhost:9091
