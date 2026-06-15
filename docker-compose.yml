@@ -10,8 +10,7 @@ services:
     restart: unless-stopped
     volumes:
       - ./bazarr:/config
-      - ./data/movies:/movies
-      - ./data/tv:/tv
+      - ./data:/data
   jackett:
     container_name: jackett
     env_file:
@@ -48,8 +47,7 @@ services:
     volumes:
       - ./plex/config:/config
       - ./plex/transcode:/transcode
-      - ./data/movies:/movies
-      - ./data/tv:/tv
+      - ./data:/data
   qbittorrent:
     container_name: qbittorrent
     env_file:
@@ -62,7 +60,7 @@ services:
     restart: unless-stopped
     volumes:
       - ./qbittorrent:/config
-      - ./data/downloads:/downloads
+      - ./data:/data
   radarr:
     container_name: radarr
     env_file:
@@ -73,8 +71,7 @@ services:
     restart: unless-stopped
     volumes:
       - ./radarr:/config
-      - ./data/downloads:/downloads
-      - ./data/movies:/movies
+      - ./data:/data
   sonarr:
     container_name: sonarr
     env_file:
@@ -85,5 +82,4 @@ services:
     restart: unless-stopped
     volumes:
       - ./sonarr:/config
-      - ./data/downloads:/downloads
-      - ./data/tv:/tv
+      - ./data:/data
