@@ -10,6 +10,12 @@ services:
     volumes:
       - ./bazarr:/config
       - ./data:/data
+  flaresolverr:
+    container_name: flaresolverr
+    image: ghcr.io/flaresolverr/flaresolverr
+    ports:
+      - 8191:8191
+    restart: unless-stopped
   jackett:
     container_name: jackett
     env_file:
