@@ -1,0 +1,1780 @@
+#!/usr/bin/env python3
+"""One native media installer/controller; one launchd supervisor; storage first."""
+import argparse
+import contextlib
+import fcntl
+import hashlib
+import ipaddress
+import json
+import os
+import pathlib
+import plistlib
+import signal
+import socket
+import subprocess
+import sys
+import time
+
+if __name__ == "__main__" and sys.version_info < (3, 11):
+    interpreter = "/opt/homebrew/bin/python3.14"
+    if not pathlib.Path(interpreter).exists():
+        raise SystemExit("Python 3.11+ is required; the selected Studio runtime is unavailable")
+    os.execv(interpreter, [interpreter, str(pathlib.Path(__file__).resolve()), *sys.argv[1:]])
+
+ROOT = pathlib.Path.home() / ".local/share/media-server"
+LABEL = "com.almirsarajcic.media-server"
+PYTHON = "/opt/homebrew/bin/python3.14"
+SCRIPT = ROOT / "media-server"
+PLIST = pathlib.Path.home() / "Library/LaunchAgents" / (LABEL + ".plist")
+DOMAIN = "gui/" + str(os.getuid())
+DAEMON_PLIST = pathlib.Path('/Library/LaunchDaemons') / (LABEL + '.plist')
+
+
+def job_domain():
+    return 'system'
+
+
+def launchctl(*args, **kwargs):
+    prefix = ['sudo', '-n'] if args[0] in ('bootstrap', 'bootout') and args[1].startswith('system') else []
+    return subprocess.run(prefix + ['/bin/launchctl', *args], **kwargs)
+
+
+def health():
+    import urllib.request
+    import urllib.error
+    import http.cookiejar
+    result = {}
+    ports = dict(MDNS_PORTS)
+    if 'flaresolverr' in json.loads((ROOT / 'state/services.json').read_text()):
+        ports['flaresolverr'] = 8191
+    for name, port in ports.items():
+        try:
+            opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+            with opener.open('http://127.0.0.1:' + str(port) + '/', timeout=2) as response:
+                result[name] = response.status < 500
+        except urllib.error.HTTPError as error:
+            result[name] = error.code in (401, 403)
+        except (OSError, urllib.error.URLError):
+            result[name] = False
+    return result
+
+
+def rotate_logs():
+    # Copy/truncate keeps the descriptors held by launchd and child apps valid.
+    import shutil
+    for path in (ROOT / 'logs').glob('*.log'):
+        if path.stat().st_size < 10 * 1024 * 1024:
+            continue
+        for n in (2, 1):
+            old = pathlib.Path(str(path) + '.' + str(n))
+            if old.exists(): old.replace(pathlib.Path(str(path) + '.' + str(n + 1)))
+        shutil.copyfile(path, str(path) + '.1')
+        with path.open('r+b') as stream: stream.truncate(0)
+
+
+def backup_state(force=False):
+    """Allow one settings snapshot writer at a time, including manual backups."""
+    with (ROOT / 'state/backup.lock').open('a') as lock:
+        os.fchmod(lock.fileno(), 0o600)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RuntimeError('Settings backup already in progress; retry after it finishes') from error
+        return _backup_state(force)
+
+
+def _backup_state(force=False):
+    """SQLite online snapshots plus private settings; exclude regenerable data."""
+    import shutil
+    import sqlite3
+    profile = json.loads((ROOT / 'state/storage.json').read_text())
+    storage_check(profile)
+    if profile['mode'] != 'external':
+        raise RuntimeError('Backups require the registered external volume')
+    base = pathlib.Path(profile['mountpoint']) / 'media-server-backups'
+    base.mkdir(mode=0o700, exist_ok=True)
+    base.chmod(0o700)
+    date = time.strftime('%Y-%m-%dT%H%M%S' if force else '%Y-%m-%d')
+    snapshots = [(json.loads((p / 'complete.json').read_text())['created_at'], p)
+                 for p in base.iterdir() if p.is_dir() and (p / 'complete.json').is_file()]
+    if not force and any(time.strftime('%Y-%m-%d', time.localtime(created)) == date
+                         for created, _ in snapshots):
+        return
+    destination = base / date
+    if (destination / 'complete.json').exists(): return
+    partial = base / (date + '.partial')
+    if partial.exists():
+        shutil.rmtree(partial)
+    partial.mkdir(mode=0o700, exist_ok=True)
+    count = 0
+    for source in (ROOT / 'state').rglob('*'):
+        relative = source.relative_to(ROOT / 'state')
+        if source.is_symlink() or not source.is_file(): continue
+        if any(p.lower() in ('cache', 'logs', 'metadata', 'mediacover', 'transcodes', 'backups', 'caddy-data', 'caddy-config') for p in relative.parts): continue
+        if source.name.endswith(('-wal', '-shm', '.lock', '.new')) or source.name in ('status.json', 'supervisor.lock'): continue
+        storage_check(profile)
+        target = partial / 'state' / relative
+        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with source.open('rb') as stream: sqlite = stream.read(16) == b'SQLite format 3\x00'
+        if sqlite:
+            with contextlib.closing(sqlite3.connect('file:' + str(source) + '?mode=ro', uri=True, timeout=10)) as original, contextlib.closing(sqlite3.connect(target)) as copy, copy:
+                original.backup(copy)
+                if copy.execute('pragma quick_check').fetchone()[0] != 'ok':
+                    raise RuntimeError('Backup SQLite check failed: ' + str(relative))
+        else:
+            shutil.copyfile(source, target)
+        target.chmod(0o600)
+        count += 1
+    # These receipts prevent a restore from re-importing deleted torrents or
+    # overwriting newer transfer preferences. They are part of recoverable state.
+    for name in ('config-import.json', 'removed-torrents.json', 'download-preferences-import.json'):
+        source = ROOT / 'checks' / name
+        if source.exists():
+            target = partial / 'checks' / name
+            target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            shutil.copyfile(source, target)
+            target.chmod(0o600)
+            count += 1
+    shutil.copyfile(SCRIPT, partial / 'media-server')
+    save_json(partial / 'complete.json', {'files': count, 'created_at': time.time(),
+              'database_consistency': 'individual SQLite online backups; not a cross-application transaction'}, private=True)
+    partial.rename(destination)
+    snapshots.append((json.loads((destination / 'complete.json').read_text())['created_at'], destination))
+    for _, old in sorted(snapshots)[:-7]: shutil.rmtree(old)
+    print('Verified native settings backup: ' + str(destination), flush=True)
+
+
+def backup_loop():
+    while True:
+        try: backup_state()
+        except Exception as error: print('Backup failed: ' + str(error), flush=True)
+        time.sleep(3600)
+
+
+def restore_original_logins():
+    """Restore archived Arr user rows offline, without changing native API keys."""
+    import sqlite3
+    import xml.etree.ElementTree as ET
+    profile = json.loads((ROOT / 'state/storage.json').read_text());storage_check(profile)
+    status = json.loads((ROOT / 'state/status.json').read_text())
+    if not (ROOT / 'state/maintenance').exists() or status.get('phase') != 'maintenance' or status.get('apps') or time.time() - status.get('checked_at', 0) > 10:
+        raise RuntimeError('Confirmed maintenance is required to restore original logins')
+    backup = ROOT / 'migration-backups' / ('login-repair-' + time.strftime('%Y%m%dT%H%M%S'))
+    backup.mkdir(mode=0o700, parents=True)
+    result = {'backup': str(backup), 'apps': {}, 'restored_at': time.time()}
+    for app in ('sonarr', 'radarr'):
+        original = pathlib.Path(profile['mountpoint']) / 'media_server' / app / (app + '.db')
+        target = ROOT / 'state' / app / (app + '.db')
+        with contextlib.closing(sqlite3.connect('file:' + str(original) + '?mode=ro', uri=True)) as old, contextlib.closing(sqlite3.connect(target)) as new:
+            columns = [r[1] for r in old.execute('pragma table_info(Users)')]
+            if columns != [r[1] for r in new.execute('pragma table_info(Users)')]:
+                raise RuntimeError('Original user schema does not match ' + app)
+            rows = old.execute('select * from Users').fetchall()
+            if not rows or any(not row[columns.index('Password')] for row in rows):
+                raise RuntimeError('Original authenticated user is missing from ' + app)
+            saved = backup / (app + '.db')
+            with contextlib.closing(sqlite3.connect(saved)) as copy: new.backup(copy)
+            saved.chmod(0o600)
+            with new:
+                new.execute('delete from Users')
+                new.executemany('insert into Users values (' + ','.join('?' for _ in columns) + ')', rows)
+                if new.execute('select * from Users').fetchall() != rows:
+                    raise RuntimeError('Original user readback failed for ' + app)
+            result['apps'][app] = {'original_users_restored': len(rows), 'native_api_key_preserved': True}
+        config = ROOT / 'state' / app / 'config.xml'
+        tree = ET.parse(config)
+        instance = tree.find('InstanceName')
+        if instance is not None:
+            instance.text = app.title();tree.write(config, encoding='utf-8', xml_declaration=True)
+    save_json(ROOT / 'checks/original-logins-restored.json', result, private=True)
+    print('Original Sonarr and Radarr login records restored; native API keys unchanged')
+
+
+def install_solver():
+    """Pinned upstream source with scoped native macOS headless adjustments."""
+    source = ROOT / 'apps/FlareSolverr'
+    commit = '93125d6ea6956906c8dfa29e169b2dc67d993dc3'
+    if not source.exists():
+        subprocess.run(['git', 'clone', '--depth', '1', '--branch', 'v3.5.2',
+                        'https://github.com/FlareSolverr/FlareSolverr.git', str(source)], check=True)
+    if subprocess.check_output(['git', '-C', str(source), 'rev-parse', 'HEAD']).decode().strip() != commit:
+        raise RuntimeError('Unexpected FlareSolverr source revision')
+    venv = ROOT / 'apps/flaresolverr-venv'
+    if not (venv / 'bin/python').exists(): subprocess.run([PYTHON, '-m', 'venv', str(venv)], check=True)
+    cached_selenium = ROOT / 'wheels/solver/selenium-4.47.0-py3-none-any.whl'
+    if cached_selenium.exists():
+        subprocess.run([str(venv / 'bin/python'), '-m', 'pip', 'install', '--no-deps', str(cached_selenium)], check=True)
+    subprocess.run([str(venv / 'bin/python'), '-m', 'pip', 'install', '--find-links', str(ROOT / 'wheels/solver'), '-r', str(source / 'requirements.txt')], check=True)
+    browser = ROOT / 'apps/flaresolverr-browser'
+    chrome = browser / 'Google Chrome.app/Contents/MacOS/Google Chrome'
+    driver = browser / 'chromedriver-mac-arm64/chromedriver'
+    browser.mkdir(exist_ok=True)
+    if not chrome.exists():
+        installed = pathlib.Path('/Applications/Google Chrome.app')
+        version = plistlib.loads((installed / 'Contents/Info.plist').read_bytes())['CFBundleShortVersionString']
+        if version != '155.0.8059.40': raise RuntimeError('Qualify a matching managed browser/driver version before installation')
+        subprocess.run(['/bin/cp', '-cR', str(installed), str(browser / 'Google Chrome.app')], check=True)
+    if not driver.exists():
+        archive = ROOT / 'installers/solver-chromedriver.zip'
+        subprocess.run(['curl', '--fail', '--silent', '--show-error', '-C', '-', '-o', str(archive),
+            'https://storage.googleapis.com/chrome-for-testing-public/155.0.8059.79/mac-arm64/chromedriver-mac-arm64.zip'], check=True)
+        subprocess.run(['ditto', '-x', '-k', str(archive), str(browser)], check=True)
+    # Upstream patches the driver binary. macOS requires a fresh signature after
+    # that patch; otherwise the kernel kills the driver at launch with signal 9.
+    env = dict(os.environ, PYTHONPATH=str(source / 'src'))
+    subprocess.run([str(venv / 'bin/python'), '-c',
+        'import sys; from undetected_chromedriver.patcher import Patcher; Patcher(executable_path=sys.argv[1]).auto()',
+        str(driver)], env=env, check=True)
+    subprocess.run(['codesign', '--force', '--sign', '-', str(driver)], check=True)
+    subprocess.run(['codesign', '--verify', '--strict', str(driver)], check=True)
+    # The upstream Linux/Xvfb branch cannot run in a macOS boot daemon.
+    utils = source / 'src/utils.py'
+    text = subprocess.check_output(['git', '-C', str(source), 'show', commit + ':src/utils.py']).decode()
+    text = text.replace("if os.name == 'nt':\n            windows_headless = True",
+                        "if os.name == 'nt' or platform.system() == 'Darwin':\n            windows_headless = True")
+    text = text.replace('driver_exe_path = None\n    version_main = None',
+                        "driver_exe_path = os.environ.get('FLARESOLVERR_DRIVER_PATH')\n    version_main = None")
+    text = text.replace('    if CHROME_EXE_PATH is not None:',
+                        "    if os.environ.get('FLARESOLVERR_BROWSER_PATH'):\n        return os.environ['FLARESOLVERR_BROWSER_PATH']\n    if CHROME_EXE_PATH is not None:")
+    utils.write_text(text)
+    config = json.loads((ROOT / 'state/services.json').read_text())
+    config['flaresolverr'] = {'command': [str(venv / 'bin/python'), '-u', str(source / 'src/flaresolverr.py')],
+        'cwd': str(source), 'environment': {'HOST': '127.0.0.1', 'PORT': '8191', 'HEADLESS': 'true',
+        'TZ': 'Africa/Nairobi', 'LOG_LEVEL': 'info', 'LOG_HTML': 'false',
+        'FLARESOLVERR_BROWSER_PATH': str(chrome), 'FLARESOLVERR_DRIVER_PATH': str(driver)}}
+    # Preserve authentication and provider settings; only wire the local Solver.
+    jackett = ROOT / 'state/jackett/Jackett/ServerConfig.json'
+    settings = json.loads(jackett.read_text());settings['FlareSolverrUrl'] = 'http://127.0.0.1:8191'
+    save_json(jackett, settings, private=True)
+    save_json(ROOT / 'state/services.json', config, private=True)
+    save_json(ROOT / 'checks/flaresolverr-install.json', {'version': '3.5.2', 'commit': commit,
+        'native_headless_patch': True, 'managed_browser': True, 'bind': '127.0.0.1:8191',
+        'dependencies': subprocess.check_output([str(venv / 'bin/python'), '-m', 'pip', 'freeze']).decode().splitlines()})
+    print('Native FlareSolverr configured under the existing media supervisor')
+
+
+def activate_acquisition():
+    """Test real providers and enable only those that pass, retaining failures."""
+    import urllib.request
+    import urllib.error
+    import xml.etree.ElementTree as ET
+    import re
+    result = {'enabled_at': time.time(), 'apps': {}, 'existing_catalog_monitoring_changed': False}
+    storage_check(json.loads((ROOT / 'state/storage.json').read_text()))
+    for app, port in [('sonarr', 8989), ('radarr', 7878)]:
+        key = ET.parse(ROOT / 'state' / app / 'config.xml').findtext('ApiKey')
+        def api(path, method='GET', data=None):
+            request = urllib.request.Request(f'http://127.0.0.1:{port}/api/v3/' + path, method=method,
+                headers={'X-Api-Key': key, 'Content-Type': 'application/json'},
+                data=json.dumps(data).encode() if data is not None else None)
+            with urllib.request.urlopen(request, timeout=120) as response:
+                body = response.read(); return json.loads(body) if body else None
+        checks = {'download_clients': [], 'indexers': []}
+        for client in api('downloadclient'):
+            client['enable'] = True
+            api('downloadclient/test', 'POST', client)
+            api('downloadclient/' + str(client['id']), 'PUT', client)
+            checks['download_clients'].append({'id': client['id'], 'name': client['name'], 'enabled': True, 'test': 'passed'})
+        for indexer in api('indexer'):
+            indexer.update(enableRss=True, enableAutomaticSearch=True, enableInteractiveSearch=True)
+            try:
+                api('indexer/test', 'POST', indexer)
+                api('indexer/' + str(indexer['id']), 'PUT', indexer)
+                entry = {'id': indexer['id'], 'name': indexer['name'], 'enabled': True, 'test': 'passed'}
+            except urllib.error.HTTPError as error:
+                message = error.read().decode(errors='replace')
+                message = re.sub(r'(?i)(apikey[=\\u0026]+)[a-z0-9]+', r'\1REDACTED', message)
+                # Details may contain provider credentials; retain them only in private runtime.
+                entry = {'id': indexer['id'], 'name': indexer['name'], 'enabled': False, 'test': 'failed', 'detail': message}
+                indexer.update(enableRss=False, enableAutomaticSearch=False, enableInteractiveSearch=False)
+                api('indexer/' + str(indexer['id']), 'PUT', indexer)
+            except (OSError, TimeoutError) as error:
+                entry = {'id': indexer['id'], 'name': indexer['name'], 'enabled': False, 'test': 'failed', 'detail': str(error)}
+                indexer.update(enableRss=False, enableAutomaticSearch=False, enableInteractiveSearch=False)
+                api('indexer/' + str(indexer['id']), 'PUT', indexer)
+            checks['indexers'].append(entry)
+            print(app + ': ' + entry['name'] + ' ' + entry['test'], flush=True)
+            result['apps'][app] = checks
+            save_json(ROOT / 'checks/acquisition.json', result, private=True)
+        if not any(i['enabled'] for i in checks['indexers']):
+            raise RuntimeError(app + ' has no qualified indexer; inspect private acquisition receipt')
+    restore_download_preferences()
+    ensure_download_import_safety()
+    complete_connections()
+    result['subtitle_scheduler_enabled'] = True
+    result['jellyfin_realtime_monitoring'] = True
+    save_json(ROOT / 'checks/acquisition.json', result, private=True)
+    save_json(ROOT / 'state/acquisition.json', {'enabled': True, 'enabled_at': time.time()}, private=True)
+    print('Qualified acquisition enabled; existing catalog monitoring unchanged')
+
+
+def ready_jellyfin_libraries(api, timeout=120):
+    """Renamed libraries need a scan before Jellyfin resolves their IDs/options."""
+    def selected():
+        return [library for library in api('/Library/VirtualFolders')
+                if any(pathlib.PurePath(path).is_relative_to(ROOT / 'media') for path in library.get('Locations', []))]
+    libraries = selected()
+    if libraries and all(x.get('ItemId') and x.get('LibraryOptions') is not None for x in libraries):
+        return libraries
+    api('/Library/Refresh', {})
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        libraries = selected()
+        if libraries and all(x.get('ItemId') and x.get('LibraryOptions') is not None for x in libraries):
+            return libraries
+        time.sleep(2)
+    raise RuntimeError('Jellyfin library IDs/options are not ready after refresh; inspect the scan before configuring')
+
+
+def complete_connections():
+    import urllib.request
+    import urllib.parse
+    services = json.loads((ROOT / 'state/services.json').read_text())
+    services['bazarr']['command'] = [arg for arg in services['bazarr']['command'] if arg != '--no-tasks']
+    save_json(ROOT / 'state/services.json', services, private=True)
+    auth = json.loads((ROOT / 'state/jellyfin-auth.json').read_text())
+    headers = {'Content-Type': 'application/json', 'Authorization': 'MediaBrowser Token="' + auth['token'] +
+               '", Client="Media Setup", Device="Mac Studio", DeviceId="media-setup", Version="1.0"'}
+    def api(path, data=None):
+        request = urllib.request.Request('http://127.0.0.1:8096' + path, headers=headers,
+                    data=json.dumps(data).encode() if data is not None else None)
+        with urllib.request.urlopen(request, timeout=30) as response:
+            body = response.read(); return json.loads(body) if body else None
+    config = api('/System/Configuration')
+    if config.get('ServerName') != 'Mac Studio':
+        config['ServerName'] = 'Mac Studio';api('/System/Configuration', config)
+    renamed = False
+    for library in ready_jellyfin_libraries(api):
+        options = library['LibraryOptions']
+        if not options.get('EnableRealtimeMonitor'):
+            options['EnableRealtimeMonitor'] = True
+            api('/Library/VirtualFolders/LibraryOptions', {'Id': library['ItemId'], 'LibraryOptions': options})
+        name = next((label for folder, label in (('movies', 'Movies'), ('tv', 'TV Shows'))
+                     if str(ROOT / 'media' / folder) in library['Locations']), None)
+        if name == library['Name']: name = None
+        if name:
+            query = urllib.parse.urlencode({'name': library['Name'], 'newName': name, 'refreshLibrary': 'false'})
+            api('/Library/VirtualFolders/Name?' + query, {})
+            renamed = True
+    if renamed:
+        api('/Library/Refresh', {})
+        ready_jellyfin_libraries(api)
+    save_json(ROOT / 'checks/production-labels.json', {'server_name': api('/System/Info/Public')['ServerName'],
+        'libraries': [x['Name'] for x in api('/Library/VirtualFolders')], 'checked_at': time.time()})
+    print('Subtitle scheduling and Jellyfin library monitoring enabled')
+
+
+def restore_download_preferences():
+    """One-time bounded import of original transfer settings via the native API."""
+    import configparser
+    import urllib.request
+    import urllib.parse
+    import http.cookiejar
+    receipt = ROOT / 'checks/download-preferences-import.json'
+    if receipt.exists(): return
+    profile = json.loads((ROOT / 'state/storage.json').read_text());storage_check(profile)
+    original = pathlib.Path(profile['mountpoint']) / 'media_server/qbittorrent/qBittorrent/qBittorrent.conf'
+    config = configparser.ConfigParser(interpolation=None);config.optionxform = str;config.read(original)
+    if not config.has_section('BitTorrent'): raise RuntimeError('Original qBittorrent transfer configuration missing')
+    fields = {
+        'GlobalDLSpeedLimit': ('dl_limit', 1024), 'GlobalUPSpeedLimit': ('up_limit', 1024),
+        'AlternativeGlobalDLSpeedLimit': ('alt_dl_limit', 1024), 'AlternativeGlobalUPSpeedLimit': ('alt_up_limit', 1024),
+        'MaxActiveTorrents': ('max_active_torrents', 1), 'MaxActiveUploads': ('max_active_uploads', 1),
+        'MaxActiveDownloads': ('max_active_downloads', 1), 'GlobalMaxRatio': ('max_ratio', 1),
+        'SlowTorrentsDownloadRate': ('slow_torrent_dl_rate_threshold', 1),
+        'SlowTorrentsUploadRate': ('slow_torrent_ul_rate_threshold', 1)}
+    values = {}
+    for old, (new, factor) in fields.items():
+        key = 'Session\\' + old
+        if key in config['BitTorrent']:
+            value = float(config['BitTorrent'][key]);values[new] = value * factor if new == 'max_ratio' else int(value * factor)
+    for old, new in [('QueueingSystemEnabled', 'queueing_enabled'), ('IgnoreSlowTorrentsForQueueing', 'dont_count_slow_torrents'),
+                     ('AddTorrentToTopOfQueue', 'add_to_top_of_queue')]:
+        if 'Session\\' + old in config['BitTorrent']: values[new] = config.getboolean('BitTorrent', 'Session\\' + old)
+    if 'max_ratio' in values: values['max_ratio_enabled'] = values['max_ratio'] >= 0
+    if config.has_option('Preferences', 'Bittorrent\\MaxRatioAction'):
+        values['max_ratio_act'] = config.getint('Preferences', 'Bittorrent\\MaxRatioAction')
+        # Removing a completed torrent can race Arr's completed-download import.
+        if values['max_ratio_act'] in (1, 3): values['max_ratio_act'] = 0
+    access = json.loads((ROOT / 'state/access.json').read_text())
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+    base = 'http://127.0.0.1:8080'
+    def post(path, data):
+        request = urllib.request.Request(base + path, data=urllib.parse.urlencode(data).encode(), headers={'Referer': base + '/'})
+        with opener.open(request, timeout=30) as response: response.read()
+    post('/api/v2/auth/login', access)
+    before = json.load(opener.open(base + '/api/v2/app/preferences', timeout=30))
+    post('/api/v2/app/setPreferences', {'json': json.dumps(values)})
+    after = json.load(opener.open(base + '/api/v2/app/preferences', timeout=30))
+    if any(after.get(k) != v for k, v in values.items()): raise RuntimeError('Transfer preference readback differs')
+    if config.has_option('BitTorrent', 'Session\\UseAlternativeGlobalSpeedLimit'):
+        post('/api/v2/transfer/setSpeedLimitsMode', {'mode': int(config.getboolean('BitTorrent', 'Session\\UseAlternativeGlobalSpeedLimit'))})
+    save_json(receipt, {'source': str(original), 'applied': values, 'previous': {k: before.get(k) for k in values},
+        'native_authentication_and_paths_preserved': True, 'restored_at': time.time()}, private=True)
+    print('Original qBittorrent transfer, queue and seeding preferences restored and read back')
+
+
+def ensure_download_import_safety():
+    """Keep completed torrents available until Arr has imported their payloads."""
+    import urllib.request
+    import urllib.parse
+    import http.cookiejar
+    storage_check(json.loads((ROOT / 'state/storage.json').read_text()))
+    access = json.loads((ROOT / 'state/access.json').read_text())
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+    base = 'http://127.0.0.1:8080'
+    def post(path, data):
+        with opener.open(urllib.request.Request(base + path, data=urllib.parse.urlencode(data).encode(),
+                headers={'Referer': base + '/'}), timeout=30) as response:
+            response.read()
+    post('/api/v2/auth/login', access)
+    before = json.load(opener.open(base + '/api/v2/app/preferences', timeout=30))
+    previous = before['max_ratio_act']
+    if previous not in (1, 3): return
+    post('/api/v2/app/setPreferences', {'json': json.dumps({'max_ratio_act': 0})})
+    after = json.load(opener.open(base + '/api/v2/app/preferences', timeout=30))
+    if after['max_ratio_act'] != 0:
+        raise RuntimeError('qBittorrent completion action did not change to stop')
+    save_json(ROOT / 'checks/download-import-safety.json', {'previous_action': previous,
+        'action': 'stop', 'checked_at': time.time()}, private=True)
+    print('qBittorrent seeding limit stops torrents instead of removing them before import')
+
+
+def test_recovery():
+    profile_path = ROOT / 'state/storage.json'
+    original = json.loads(profile_path.read_text())
+    state_path = ROOT / 'state/status.json'
+    before = json.loads(state_path.read_text())
+    if original['mode'] != 'external' or before.get('phase') != 'running':
+        raise RuntimeError('Recovery test requires the healthy external stack')
+    save_json(ROOT / 'checks/storage-profile-before-recovery.json', original, private=True)
+    blocked = False
+    try:
+        save_json(profile_path, {**original, 'volume_uuid': '00000000-0000-0000-0000-000000000000'})
+        deadline = time.monotonic() + 75
+        while time.monotonic() < deadline:
+            state = json.loads(state_path.read_text())
+            if state.get('phase') == 'blocked' and not state.get('apps'):
+                open_ports = []
+                for port in [80, *MDNS_PORTS.values(), *([8191] if 'flaresolverr' in before['apps'] else [])]:
+                    try:
+                        with socket.create_connection(('127.0.0.1', port), timeout=0.5): open_ports.append(port)
+                    except OSError: pass
+                if open_ports: raise RuntimeError('Ports remained open after storage loss: ' + str(open_ports))
+                blocked = True
+                break
+            time.sleep(2)
+        if not blocked: raise RuntimeError('Storage gate did not stop the stack')
+    finally:
+        save_json(profile_path, original)
+    deadline = time.monotonic() + 150
+    while time.monotonic() < deadline:
+        after = json.loads(state_path.read_text())
+        if after.get('phase') == 'running' and len(after.get('apps', {})) == len(before['apps']) and len(after.get('mdns', {})) == 6 and after.get('proxy'):
+            if any(after['apps'][n] == pid for n, pid in before['apps'].items()):
+                raise RuntimeError('An app PID was not replaced during recovery')
+            save_json(ROOT / 'checks/external-recovery.json', {'blocked_wrong_uuid': blocked, 'all_ports_closed': True,
+                      'apps_recovered': len(after['apps']), 'proxy_and_aliases_recovered': True, 'job_domain': job_domain(),
+                      'physical_disconnect': False, 'checked_at': time.time()})
+            print('External UUID gate stopped all media ports and recovered all apps, proxy and aliases')
+            return
+        time.sleep(2)
+    raise RuntimeError('Real profile restored, but healthy recovery timed out; inspect status/logs')
+
+
+def prepare_boot():
+    """Prepare a bounded administrator handoff; never run media apps as root."""
+    import pwd
+    import shlex
+    user = pwd.getpwuid(os.getuid()).pw_name
+    services = json.loads((ROOT / 'state/services.json').read_text())
+    if 'qbittorrent-nox' not in services['qbittorrent']['command'][0]:
+        raise RuntimeError('Install and select headless qBittorrent first')
+    job = startup_job()
+    job['UserName'] = user
+    job['GroupName'] = 'staff'
+    job['Umask'] = 0o077
+    prepared = ROOT / 'state' / (LABEL + '.boot.plist')
+    prepared.write_bytes(plistlib.dumps(job))
+    q = shlex.quote
+    # This script only installs the prepared plist. The supervisor always runs
+    # as UserName. No user-writable Python is executed with administrator rights.
+    body = '\n'.join([
+        '#!/bin/sh', 'set -eu',
+        'test "$(id -u)" = 0 || { echo "Run with sudo"; exit 1; }',
+        '/usr/bin/plutil -lint ' + q(str(prepared)),
+        'if /bin/launchctl print ' + q(DOMAIN + '/' + LABEL) + ' >/dev/null 2>&1; then',
+        '  echo "Stop the media login supervisor before installing boot startup"; exit 1', 'fi',
+        '/usr/bin/install -o root -g wheel -m 644 ' + q(str(prepared)) + ' ' + q(str(DAEMON_PLIST)),
+        'if test -f ' + q(str(PLIST)) + '; then /bin/rm ' + q(str(PLIST)) + '; fi',
+        'if ! /bin/launchctl print ' + q('system/' + LABEL) + ' >/dev/null 2>&1; then',
+        '  /bin/launchctl bootstrap system ' + q(str(DAEMON_PLIST)), 'fi',
+        '/bin/launchctl print ' + q('system/' + LABEL), ''])
+    target = ROOT / 'install-boot.sh'
+    target.write_text(body); target.chmod(0o700)
+    (ROOT / 'state/maintenance').touch(mode=0o600)
+    print('Administrator installation: sudo /bin/sh ' + q(str(target)))
+
+
+def save_json(path, value, private=False):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix(path.suffix + ".new")
+    temp.write_text(json.dumps(value, indent=2))
+    temp.chmod(0o600 if private else 0o644)
+    temp.replace(path)
+
+
+def disk_info(identifier):
+    result = subprocess.run(
+        ["/usr/sbin/diskutil", "info", "-plist", str(identifier)],
+        capture_output=True, timeout=12,
+    )
+    if result.returncode:
+        raise RuntimeError("Expected media volume is unavailable")
+    return plistlib.loads(result.stdout)
+
+
+def storage_check(profile, mount=False):
+    """Never accept an ordinary folder in place of the configured volume."""
+    if profile.get("mode") != "external":
+        raise RuntimeError("A registered external storage profile is required")
+    uuid = profile.get("volume_uuid")
+    if not uuid:
+        raise RuntimeError("Expected media volume UUID is not configured")
+    expected_mount = pathlib.Path(profile["mountpoint"])
+    info = disk_info(uuid)
+    if str(info.get("VolumeUUID", "")).upper() != uuid.upper():
+        raise RuntimeError("Media volume UUID does not match")
+    if profile["mode"] == "external" and info.get("Internal", True):
+        raise RuntimeError("External storage profile resolved to an internal volume")
+    if not info.get("MountPoint") and mount and profile["mode"] == "external":
+        result = subprocess.run(
+            ["/usr/sbin/diskutil", "mount", info["DeviceIdentifier"]],
+            capture_output=True, timeout=25,
+        )
+        if result.returncode:
+            raise RuntimeError("Expected media volume could not be mounted")
+        info = disk_info(uuid)
+    if str(info.get("VolumeUUID", "")).upper() != uuid.upper():
+        raise RuntimeError("Media volume UUID does not match")
+    if info.get("MountPoint") != str(expected_mount):
+        raise RuntimeError("Expected media volume is not mounted at its configured location")
+    if not info.get("WritableVolume", False):
+        raise RuntimeError("Expected media volume is read-only")
+    device = expected_mount.stat().st_dev
+    media = pathlib.Path(profile["media_root"])
+    if profile["mode"] == "external" and not media.resolve().is_relative_to(expected_mount.resolve()):
+        raise RuntimeError("Media root is outside the verified volume")
+    if profile["mode"] == "external" and (ROOT / "media").resolve() != media.resolve():
+        raise RuntimeError("Stable application media path does not point to the verified external root")
+    marker = media / ".media-server-storage"
+    if not marker.is_file() or marker.read_text().strip() != profile["marker"]:
+        raise RuntimeError("Media storage marker is missing or does not match")
+    for name in ("movies", "tv", "downloads"):
+        directory = media / name
+        if not directory.is_dir() or directory.stat().st_dev != device:
+            raise RuntimeError("Required media directory is missing or on a different volume: " + name)
+        if not directory.resolve().is_relative_to(media.resolve()):
+            raise RuntimeError("Media directory points outside the verified media root")
+        if not os.access(directory, os.W_OK):
+            raise RuntimeError("Required media directory is not writable: " + name)
+    return info
+
+
+def stop_children(children):
+    """Only our own process groups; no dependence on a removed media volume."""
+    for process, _ in children.values():
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGTERM)
+    deadline = time.monotonic() + 20
+    while any(p.poll() is None for p, _ in children.values()) and time.monotonic() < deadline:
+        time.sleep(0.2)
+    for process, _ in children.values():
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            process.wait(timeout=2)
+    children.clear()
+
+
+MDNS_PORTS = {"jellyfin": 8096, "sonarr": 8989, "radarr": 7878,
+              "bazarr": 6767, "jackett": 9117, "qbittorrent": 8080}
+
+
+def proxy_config():
+    policy = ROOT / 'state/home-access.json'
+    networks = json.loads(policy.read_text())['management_networks'] if policy.exists() else []
+    if policy.exists() and not networks:
+        raise ValueError('Password-free management requires an explicit home subnet')
+    networks = [str(home_network(value)) for value in networks]
+    blocks = []
+    for name, port in MDNS_PORTS.items():
+        gate = ''
+        if networks and name != 'jellyfin':
+            gate = '\t@outside not remote_ip 127.0.0.1 ::1 ' + ' '.join(networks) + '\n'
+            gate += '\trespond @outside "Home network only" 403\n'
+        blocks.append(f'http://{name}.local {{\n{gate}\treverse_proxy 127.0.0.1:{port}\n}}\n')
+    return "{\n\tadmin off\n\tauto_https off\n}\n\n" + '\n'.join(blocks)
+
+
+def home_network(value):
+    network = ipaddress.ip_network(value, strict=True)
+    private = [ipaddress.ip_network(x) for x in ('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16')]
+    if network.version != 4 or not any(network.subnet_of(x) for x in private):
+        raise ValueError('Select the actual private IPv4 home subnet')
+    return network
+
+
+def configure_home_access(network):
+    """LAN-only password-free management; Jellyfin keeps its personal account."""
+    import configparser
+    import io
+    import http.cookiejar
+    import urllib.request
+    import xml.etree.ElementTree as ET
+    network = str(home_network(network))
+    storage_check(json.loads((ROOT / 'state/storage.json').read_text()))
+    state = ROOT / 'state'
+    services = json.loads((state / 'services.json').read_text())
+    targets = {'sonarr', 'radarr', 'jackett', 'bazarr', 'qbittorrent'}
+    if not targets.issubset(services) or not proxy_services():
+        raise RuntimeError('All management apps and Caddy must be configured first')
+    status = json.loads((state / 'status.json').read_text())
+    if status.get('phase') != 'running' or time.time() - status.get('checked_at', 0) > 15:
+        raise RuntimeError('Home access setup requires fresh healthy status')
+    backup = ROOT / 'migration-backups' / ('home-access-' + time.strftime('%Y%m%dT%H%M%S'))
+    backup.mkdir(parents=True, mode=0o700)
+    originals = {}
+    def remember(path):
+        originals[path] = path.read_bytes() if path.exists() else None
+        if originals[path] is not None:
+            saved = backup / path.relative_to(ROOT)
+            saved.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+            saved.write_bytes(originals[path]);saved.chmod(0o600)
+    def wait_for(predicate, message, timeout=90):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            current = json.loads((state / 'status.json').read_text())
+            if predicate(current): return
+            time.sleep(1)
+        raise RuntimeError(message)
+    for path in (state / 'services.json', state / 'home-access.json', state / 'Caddyfile'):
+        remember(path)
+    try:
+        # The network gate must be loaded before removing any app login checks.
+        save_json(state / 'home-access.json', {'management_networks': [network],
+            'jellyfin_personal_account': True}, private=True)
+        candidate = state / 'Caddyfile.next'
+        candidate.write_text(proxy_config())
+        subprocess.run([str(ROOT / 'apps/caddy/caddy'), 'validate', '--config', str(candidate),
+                        '--adapter', 'caddyfile'], check=True, capture_output=True)
+        old_proxy = status['proxy']
+        candidate.replace(state / 'Caddyfile')
+        wait_for(lambda s: s.get('proxy') and s['proxy'] != old_proxy,
+                 'Caddy has not loaded the home network boundary')
+        save_json(state / 'services.json', {k:v for k,v in services.items() if k not in targets}, private=True)
+        wait_for(lambda s: not targets.intersection(s.get('apps', {})),
+                 'Management apps did not stop; login settings untouched')
+        paths = [state / app / 'config.xml' for app in ('sonarr', 'radarr')]
+        paths += [state / 'qbittorrent/qBittorrent/config/qBittorrent.ini',
+                  state / 'bazarr/config/config.yaml', state / 'jackett/Jackett/ServerConfig.json']
+        for path in paths: remember(path)
+        for app in ('sonarr', 'radarr'):
+            path = state / app / 'config.xml';tree = ET.parse(path)
+            for name, value in {'BindAddress':'127.0.0.1', 'AuthenticationRequired':'DisabledForLocalAddresses',
+                                'TrustedNetworks':'127.0.0.1', 'AllowedHosts':app + '.local,127.0.0.1,localhost'}.items():
+                node = tree.find(name)
+                if node is None: node = ET.SubElement(tree.getroot(), name)
+                node.text = value
+            tree.write(path, encoding='utf-8', xml_declaration=True)
+        path = state / 'qbittorrent/qBittorrent/config/qBittorrent.ini'
+        config = configparser.ConfigParser(interpolation=None);config.optionxform = str;config.read(path)
+        config['Preferences'].update({'WebUI\\Address':'127.0.0.1', 'WebUI\\LocalHostAuth':'false',
+                                      'WebUI\\AuthSubnetWhitelistEnabled':'false'})
+        text = io.StringIO();config.write(text);path.write_text(text.getvalue());path.chmod(0o600)
+        path = state / 'jackett/Jackett/ServerConfig.json'
+        config = json.loads(path.read_text());config.update(AllowExternal=False, LocalBindAddress='127.0.0.1', AdminPassword='')
+        save_json(path, config, private=True)
+        services['jackett']['command'] = [arg for arg in services['jackett']['command'] if arg != '--ListenPublic']
+        code = '''import pathlib,sys,yaml
+p=pathlib.Path(sys.argv[1]);v=yaml.safe_load(p.read_text())
+v['auth']['type']=None;v['general']['ip']='127.0.0.1'
+p.write_text(yaml.safe_dump(v));p.chmod(0o600)
+'''
+        env = dict(os.environ, PYTHONPATH=str(ROOT / 'apps/bazarr/libs'))
+        subprocess.run([str(ROOT / 'apps/bazarr-venv/bin/python'), '-c', code,
+                        str(state / 'bazarr/config/config.yaml')], env=env, check=True)
+        save_json(state / 'services.json', services, private=True)
+        wait_for(lambda s: s.get('phase') == 'running' and targets.issubset(s.get('apps', {})),
+                 'Management apps did not recover with home access settings', timeout=180)
+        for name, endpoint in {'sonarr':'/', 'radarr':'/',
+                               'jackett':'/UI/Dashboard', 'bazarr':'/', 'qbittorrent':'/api/v2/app/version'}.items():
+            request = urllib.request.Request('http://127.0.0.1' + endpoint, headers={'Host':name + '.local'})
+            opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+            try:
+                with opener.open(request, timeout=20) as response:
+                    if response.status != 200 or '/login' in response.url.lower():
+                        raise RuntimeError(name + ' still requires a browser login')
+            except urllib.error.HTTPError as error:
+                raise RuntimeError(name + ' password-free check failed: HTTP ' + str(error.code)) from error
+        save_json(ROOT / 'checks/home-access.json', {'network':network, 'management_passwords_required':False,
+            'jellyfin_account_preserved':True, 'backup':str(backup), 'checked_at':time.time()}, private=True)
+    except Exception:
+        # Restore app configuration before restoring the former proxy policy.
+        save_json(state / 'services.json', {k:v for k,v in services.items() if k not in targets}, private=True)
+        wait_for(lambda s: not targets.intersection(s.get('apps', {})), 'Rollback requires stopped management apps')
+        for path, content in originals.items():
+            if path.name in ('services.json', 'Caddyfile', 'home-access.json'): continue
+            if content is not None: path.write_bytes(content);path.chmod(0o600)
+        for path in (state / 'home-access.json', state / 'Caddyfile', state / 'services.json'):
+            content = originals[path]
+            if content is None: path.unlink(missing_ok=True)
+            else: path.write_bytes(content);path.chmod(0o600)
+        raise
+    print('Home-network management opens without passwords; Jellyfin account retained')
+
+
+def configure_proxy(enabled=True):
+    """Install pinned official native Caddy; normal startup never downloads."""
+    import urllib.request
+    import tarfile
+    if enabled:
+        storage_check(json.loads((ROOT / "state/storage.json").read_text()))
+        version = "2.11.7"
+        expected = "cda3030e5d5b13eb9f0b6fb541037f633bddd958c070c5f561d7a5cccb581665"
+        archive = ROOT / "installers" / ("caddy_" + version + "_mac_arm64.tar.gz")
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        if not archive.exists() or hashlib.sha256(archive.read_bytes()).hexdigest() != expected:
+            url = "https://github.com/caddyserver/caddy/releases/download/v" + version + "/" + archive.name
+            temp = archive.with_suffix(".download")
+            with urllib.request.urlopen(url, timeout=120) as response, temp.open("wb") as out:
+                import shutil
+                shutil.copyfileobj(response, out)
+            if hashlib.sha256(temp.read_bytes()).hexdigest() != expected:
+                raise RuntimeError("Caddy package checksum does not match official release")
+            temp.replace(archive)
+        target = ROOT / "apps/caddy/caddy"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(archive, "r:gz") as package:
+            member = package.getmember("caddy")
+            if not member.isfile():
+                raise RuntimeError("Caddy archive does not contain a regular executable")
+            content = package.extractfile(member).read()
+        if not target.exists() or target.read_bytes() != content:
+            temp = target.with_suffix(".new"); temp.write_bytes(content); temp.chmod(0o755); temp.replace(target)
+        config = ROOT / "state/Caddyfile"
+        config.write_text(proxy_config())
+        subprocess.run([str(target), "validate", "--config", str(config), "--adapter", "caddyfile"], check=True)
+        save_json(ROOT / "checks/caddy-install.json", {"version": version, "archive_sha256": expected,
+                  "binary_sha256": hashlib.sha256(content).hexdigest()})
+    save_json(ROOT / "state/proxy.json", {"enabled": enabled})
+    print("Port-free HTTP routing " + ("enabled" if enabled else "disabled") + "; restart supervisor after source updates")
+
+
+def proxy_services():
+    path = ROOT / "state/proxy.json"
+    if not path.exists() or not json.loads(path.read_text()).get("enabled", False):
+        return {}
+    config = ROOT / "state/Caddyfile"
+    return {"proxy-caddy": {"command": [str(ROOT / "apps/caddy/caddy"), "run",
+            "--config", str(config), "--adapter", "caddyfile"],
+            "environment": {"XDG_DATA_HOME": str(ROOT / "state/caddy-data"),
+                            "XDG_CONFIG_HOME": str(ROOT / "state/caddy-config"),
+                            "MEDIA_PROXY_CONFIG_SHA": hashlib.sha256(config.read_bytes()).hexdigest()}}}
+
+
+def mdns_services(config):
+    """Advertise local aliases through macOS Bonjour, under the same supervisor."""
+    if not config.get("enabled", False):
+        return {}
+    address = subprocess.run(["/usr/sbin/ipconfig", "getifaddr", config["interface"]],
+                             capture_output=True, text=True, timeout=5)
+    if address.returncode:
+        return {}  # Network can recover independently of mounted media.
+    try:
+        ipv4 = str(ipaddress.IPv4Address(address.stdout.strip()))
+    except ipaddress.AddressValueError:
+        return {}
+    return {"mdns-" + name: {"command": ["/usr/bin/dns-sd", "-P",
+            "Studio " + name, "_http._tcp", "local.", str(80 if proxy_services() else port), name + ".local", ipv4]}
+            for name, port in MDNS_PORTS.items()}
+
+
+def supervise():
+    ROOT.mkdir(parents=True, exist_ok=True)
+    (ROOT / "logs").mkdir(exist_ok=True)
+    lock = (ROOT / "state/supervisor.lock").open("w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise RuntimeError("The media supervisor is already running")
+    lock.write(str(os.getpid())); lock.flush()
+    children = {}
+    stopping = False
+    last_message = None
+    restart_after = {}
+    last_health = 0
+    endpoints = {}
+    def stop_signal(_signum, _frame):
+        nonlocal stopping
+        stopping = True
+    signal.signal(signal.SIGTERM, stop_signal)
+    signal.signal(signal.SIGINT, stop_signal)
+    try:
+        while not stopping:
+            try:
+                if (ROOT / 'state/maintenance').exists():
+                    raise RuntimeError('Intentional maintenance stop')
+                profile = json.loads((ROOT / "state/storage.json").read_text())
+                storage_check(profile, mount=True)
+                services = json.loads((ROOT / "state/services.json").read_text())
+                if not services:
+                    raise RuntimeError("No native media applications are configured")
+                app_names = set(services)
+                if profile['mode'] == 'external':
+                    services['settings-backup'] = {'command': [PYTHON, str(SCRIPT), 'backup-loop']}
+                services.update(proxy_services())
+                mdns_path = ROOT / "state/mdns.json"
+                if mdns_path.exists():
+                    services.update(mdns_services(json.loads(mdns_path.read_text())))
+                for name in list(children):
+                    proc, signature = children[name]
+                    expected = json.dumps(services.get(name), sort_keys=True)
+                    if name not in services or signature != expected:
+                        subset = {name: children.pop(name)}; stop_children(subset)
+                    elif proc.poll() is not None:
+                        with contextlib.suppress(ProcessLookupError):
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        children.pop(name)
+                        restart_after[name] = time.monotonic() + 30
+                        print(name + " exited; retrying after 30 seconds", flush=True)
+                for name, settings in services.items():
+                    if name in children or time.monotonic() < restart_after.get(name, 0):
+                        continue
+                    # Check immediately before each start, including process-crash recovery.
+                    storage_check(profile)
+                    environment = os.environ.copy()
+                    environment.update(settings.get("environment", {}))
+                    with (ROOT / "logs" / (name + ".stdout.log")).open("ab") as out, \
+                         (ROOT / "logs" / (name + ".stderr.log")).open("ab") as err:
+                        proc = subprocess.Popen(settings["command"], cwd=settings.get("cwd", ROOT),
+                                                env=environment, stdout=out, stderr=err,
+                                                start_new_session=True)
+                    children[name] = (proc, json.dumps(settings, sort_keys=True))
+                    print("Started " + name + " after storage verification", flush=True)
+                if time.monotonic() - last_health >= 30:
+                    endpoints = health()
+                    rotate_logs()
+                    last_health = time.monotonic()
+                ready = len(children.keys() & app_names) == len(app_names) and all(endpoints.get(n, False) for n in app_names)
+                message = "Native media stack " + ('healthy' if ready else 'starting or degraded') + " on verified " + profile["mode"] + " storage"
+                state = {"phase": "running" if ready else "degraded", "endpoints": endpoints, "storage_mode": profile["mode"],
+                         "supervisor_pid": os.getpid(), "apps": {n: p.pid for n, (p, _) in children.items() if n in app_names},
+                         "mdns": {n.removeprefix("mdns-"): p.pid for n, (p, _) in children.items()
+                                  if n.startswith("mdns-")},
+                         "proxy": {n: p.pid for n, (p, _) in children.items() if n.startswith("proxy-")},
+                         "workers": {n: p.pid for n, (p, _) in children.items() if n == "settings-backup"}}
+            except (RuntimeError, OSError, ValueError, KeyError, subprocess.TimeoutExpired) as exc:
+                stop_children(children)
+                message = "Media startup blocked: " + str(exc)
+                state = {"phase": "maintenance" if (ROOT / 'state/maintenance').exists() else "blocked", "reason": str(exc), "supervisor_pid": os.getpid(), "apps": {}}
+            if message != last_message:
+                print(message, flush=True); last_message = message
+            state["checked_at"] = time.time()
+            save_json(ROOT / "state/status.json", state)
+            # Re-check mount loss frequently; successful recovery needs no manual action.
+            for _ in range(5):
+                if stopping: break
+                time.sleep(1)
+    finally:
+        stop_children(children)
+        save_json(ROOT / "state/status.json", {"phase": "stopped", "apps": {}, "checked_at": time.time()})
+        lock.close()
+
+
+def startup_job():
+    return {"Label": LABEL, "ProgramArguments": [PYTHON, str(SCRIPT), "run"],
+           "RunAtLoad": True, "KeepAlive": True, "ThrottleInterval": 30,
+           "ExitTimeOut": 30, "AbandonProcessGroup": False,
+           "WorkingDirectory": str(ROOT),
+           "StandardOutPath": str(ROOT / "logs/supervisor.log"),
+           "StandardErrorPath": str(ROOT / "logs/supervisor.stderr.log"),
+           "EnvironmentVariables": {"HOME": str(pathlib.Path.home()),
+                                    "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"}}
+
+
+def install_startup():
+    import pwd
+    import shutil
+    if not DAEMON_PLIST.exists():
+        raise RuntimeError('System boot service is not installed; run prepare-boot and its administrator installer first')
+    job = plistlib.loads(DAEMON_PLIST.read_bytes())
+    expected = {'Label': LABEL, 'ProgramArguments': [PYTHON, str(SCRIPT), 'run'],
+                'WorkingDirectory': str(ROOT), 'UserName': pwd.getpwuid(os.getuid()).pw_name}
+    if expected['UserName'] == 'root' or any(job.get(key) != value for key, value in expected.items()) or 'LimitLoadToSessionType' in job:
+        raise RuntimeError('System boot job does not match this runtime/owner; reinstall the prepared boot job')
+    SCRIPT.parent.mkdir(parents=True, exist_ok=True)
+    if pathlib.Path(__file__).resolve() != SCRIPT.resolve():
+        candidate = SCRIPT.with_name(SCRIPT.name + '.next')
+        shutil.copyfile(pathlib.Path(__file__).resolve(), candidate)
+        candidate.chmod(0o755)
+        candidate.replace(SCRIPT)
+    SCRIPT.chmod(0o755)
+    loaded = launchctl('print', 'system/' + LABEL, capture_output=True, text=True)
+    if loaded.returncode:
+        launchctl('bootstrap', 'system', str(DAEMON_PLIST), check=True)
+        loaded = launchctl('print', 'system/' + LABEL, capture_output=True, text=True)
+    if loaded.returncode or str(SCRIPT) not in {line.strip() for line in loaded.stdout.splitlines()}:
+        raise RuntimeError('Loaded system boot job does not run this controller; maintenance remains enabled')
+    (ROOT / 'state/maintenance').unlink(missing_ok=True)
+    print('System media supervisor active')
+
+
+def require_stopped():
+    """Never replace installed applications while the owned stack is live."""
+    if launchctl('print', 'system/' + LABEL, capture_output=True).returncode:
+        return
+    path = ROOT / 'state/status.json'
+    state = json.loads(path.read_text()) if path.exists() else {}
+    if not (ROOT / 'state/maintenance').exists() or state.get('phase') != 'maintenance' or state.get('apps') or time.time() - state.get('checked_at', 0) > 15:
+        raise RuntimeError('Stop the media stack and require fresh maintenance status before changing installed applications')
+
+
+def require_rebuild_state():
+    """Rebuild dependencies around restored state; never invent replacement accounts."""
+    required = ('access.json', 'jellyfin-auth.json', 'sonarr/config.xml', 'sonarr/sonarr.db',
+                'radarr/config.xml', 'radarr/radarr.db', 'bazarr/config/config.yaml', 'bazarr/db/bazarr.db',
+                'jackett/Jackett/ServerConfig.json', 'qbittorrent/qBittorrent/config/qBittorrent.ini',
+                'jellyfin/config/system.xml', 'jellyfin/data/data/jellyfin.db')
+    missing = [name for name in required if not (ROOT / 'state' / name).is_file() or not (ROOT / 'state' / name).stat().st_size]
+    if missing:
+        raise RuntimeError('Restore native settings before staging; missing: ' + ', '.join(missing))
+
+
+def register_external(uuid, mountpoint, media_root):
+    """Explicit migration step, never formatting, copying, or guessing a disk."""
+    if not uuid or not mountpoint or not media_root:
+        raise RuntimeError("External registration requires UUID, mountpoint and existing media root")
+    active = launchctl("print", job_domain() + "/" + LABEL, capture_output=True)
+    if not active.returncode:
+        state = json.loads((ROOT / 'state/status.json').read_text())
+        if not (ROOT / 'state/maintenance').exists() or state.get('phase') != 'maintenance' or state.get('apps') or time.time() - state.get('checked_at', 0) > 10:
+            raise RuntimeError("Stop the media supervisor before changing storage")
+    info = disk_info(uuid)
+    if str(info.get("VolumeUUID", "")).upper() != uuid.upper() or info.get("Internal", True):
+        raise RuntimeError("Configured UUID is not the intended external volume")
+    if not info.get("MountPoint"):
+        result = subprocess.run(["/usr/sbin/diskutil", "mount", info["DeviceIdentifier"]], capture_output=True, timeout=25)
+        if result.returncode:
+            raise RuntimeError("External volume cannot be mounted")
+        info = disk_info(uuid)
+    if info.get("MountPoint") != mountpoint or not info.get("WritableVolume", False):
+        raise RuntimeError("External volume mount or writable status does not match")
+    media = pathlib.Path(media_root).resolve()
+    volume = pathlib.Path(mountpoint).resolve()
+    if not media.is_relative_to(volume):
+        raise RuntimeError("External media folder is outside the selected volume")
+    for name in ("movies", "tv", "downloads"):
+        if not (media / name).is_dir() or (media / name).stat().st_dev != volume.stat().st_dev:
+            raise RuntimeError("External media directories must already exist on the selected volume")
+    import secrets
+    marker_file = media / ".media-server-storage"
+    marker = marker_file.read_text().strip() if marker_file.exists() else secrets.token_hex(16)
+    if not marker:
+        raise RuntimeError("External media marker is empty")
+    marker_file.write_text(marker + "\n")
+    profile = {"mode": "external", "volume_uuid": uuid, "mountpoint": mountpoint,
+               "media_root": str(media), "marker": marker}
+    stable = ROOT / "media"
+    if stable.exists() or stable.is_symlink():
+        raise RuntimeError("Media path already exists; review the registered profile before replacing it")
+    try:
+        stable.symlink_to(media, target_is_directory=True)
+        storage_check(profile)
+        save_json(ROOT / "state/storage.json", profile)
+    except Exception:
+        if stable.is_symlink(): stable.unlink()
+        raise
+    print("External volume registered. Run check, then start.")
+
+
+def stop_supervisor():
+    (ROOT / 'state/maintenance').touch(mode=0o600)
+    deadline = time.monotonic() + 45
+    while time.monotonic() < deadline:
+        state = json.loads((ROOT / 'state/status.json').read_text())
+        if state.get('phase') == 'maintenance' and not state.get('apps') and time.time() - state.get('checked_at', 0) < 10:
+            print('All media processes stopped; boot supervisor retains durable maintenance hold')
+            return
+        time.sleep(0.5)
+    raise RuntimeError('System supervisor has not confirmed maintenance stop')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("command", choices=["packages", "stage", "start", "stop", "run", "check", "status", "storage", "verify", "mdns", "proxy", "headless", "prepare-boot", "backup", "backup-loop", "import-configs", "test-recovery", "solver", "acquisition", "restore-logins", "home-access"])
+    parser.add_argument("--uuid")
+    parser.add_argument("--mountpoint")
+    parser.add_argument("--media-root")
+    parser.add_argument("--network", help="Actual private IPv4 home subnet, for password-free management")
+    parser.add_argument("--interface", default="en1", help="Studio LAN interface for mDNS")
+    parser.add_argument("--disable", action="store_true", help="Disable the selected mDNS or proxy feature")
+    args = parser.parse_args()
+    if args.command in ('stage', 'headless', 'solver'):
+        require_stopped()
+    if args.command == 'stage':
+        require_rebuild_state()
+    if args.command == "run":
+        supervise()
+    elif args.command == 'import-configs':
+        import_configs()
+    elif args.command == 'restore-logins':
+        restore_original_logins()
+    elif args.command == 'home-access':
+        configure_home_access(args.network)
+    elif args.command == 'headless':
+        install_headless()
+    elif args.command == 'solver':
+        install_solver()
+    elif args.command == 'acquisition':
+        activate_acquisition()
+    elif args.command == 'prepare-boot':
+        prepare_boot()
+    elif args.command == 'backup':
+        backup_state(force=True)
+    elif args.command == 'backup-loop':
+        backup_loop()
+    elif args.command == 'test-recovery':
+        test_recovery()
+    elif args.command == "proxy":
+        configure_proxy(enabled=not args.disable)
+    elif args.command == "mdns":
+        config = {"enabled": not args.disable, "interface": args.interface}
+        if not args.disable and not mdns_services(config):
+            raise RuntimeError("Selected LAN interface has no usable IPv4 address")
+        save_json(ROOT / "state/mdns.json", config)
+        print("mDNS configuration saved; running supervisor applies it within five seconds")
+    elif args.command == "check":
+        profile = json.loads((ROOT / "state/storage.json").read_text())
+        storage_check(profile)
+        print("Expected volume, mount, writable media and required paths verified")
+    elif args.command == "start":
+        storage_check(json.loads((ROOT / "state/storage.json").read_text()), mount=True)
+        install_startup()
+    elif args.command == "stop":
+        stop_supervisor()
+    elif args.command == "status":
+        path = ROOT / "state/status.json"
+        state = json.loads(path.read_text()) if path.exists() else {'phase': 'not_started'}
+        state['job_loaded'] = launchctl('print', job_domain() + '/' + LABEL, capture_output=True).returncode == 0
+        state['job_domain'] = job_domain()
+        if state.get('phase') in ('running', 'degraded', 'maintenance', 'blocked') and (not state['job_loaded'] or time.time() - state.get('checked_at', 0) > 90):
+            state['phase'] = 'stale'
+        print(json.dumps(state, indent=2))
+    elif args.command == "storage":
+        register_external(args.uuid, args.mountpoint, args.media_root)
+    elif args.command == "verify":
+        verify_services()
+    elif args.command == "packages":
+        download_all_packages()
+    elif args.command == "stage":
+        stage_native_apps()
+        prepare_native_services()
+
+
+# Installation/configuration functions are maintained below in this same script.
+
+def import_configs():
+    """Offline original import, preserving histories and stopping all acquisition."""
+    import shutil
+    import sqlite3
+    import xml.etree.ElementTree as ET
+    profile = json.loads((ROOT / 'state/storage.json').read_text())
+    storage_check(profile)
+    if profile['mode'] != 'external': raise RuntimeError('Finish external restore first')
+    if launchctl('print', job_domain() + '/' + LABEL, capture_output=True).returncode == 0:
+        state = json.loads((ROOT / 'state/status.json').read_text())
+        if not (ROOT / 'state/maintenance').exists() or state.get('phase') != 'maintenance' or state.get('apps') or time.time() - state.get('checked_at', 0) > 10:
+            raise RuntimeError('Stop the supervisor before importing original state')
+    receipt = ROOT / 'checks/config-import.json'
+    if receipt.exists(): raise RuntimeError('Original import already recorded; do not overwrite newer state')
+    original = pathlib.Path(profile['mountpoint']) / 'media_server'
+    for app in ('sonarr', 'radarr'):
+        if not (original / app / (app + '.db')).exists(): raise RuntimeError('Original database restore is incomplete')
+    snapshot = ROOT / 'migration-backups' / time.strftime('%Y%m%dT%H%M%S')
+    snapshot.mkdir(parents=True, mode=0o700)
+    shutil.copytree(ROOT / 'state', snapshot / 'state')
+    media = str(ROOT / 'media')
+    access = json.loads((ROOT / 'state/access.json').read_text())
+    jackett = json.loads((ROOT / 'state/jackett/Jackett/ServerConfig.json').read_text())
+    result = {'backup': str(snapshot), 'automatic_acquisition': False, 'databases': {}}
+    try:
+        for app, catalog in [('sonarr', 'Series'), ('radarr', 'Movies')]:
+            target = ROOT / 'state' / app / (app + '.db')
+            native = sqlite3.connect('file:' + str(target) + '?mode=ro', uri=True)
+            user_columns = [r[1] for r in native.execute('pragma table_info(Users)')]
+            native.close()
+            for suffix in ('-wal', '-shm'):
+                target.with_name(target.name + suffix).unlink(missing_ok=True)
+            shutil.copy2(original / app / (app + '.db'), target)
+            with contextlib.closing(sqlite3.connect(target)) as db:
+                if db.execute('pragma quick_check').fetchone()[0] != 'ok': raise RuntimeError('Invalid original ' + app + ' database')
+                if [r[1] for r in db.execute('pragma table_info(Users)')] != user_columns:
+                    raise RuntimeError('Original login schema is incompatible with native app')
+                if not db.execute('select count(*) from Users').fetchone()[0]:
+                    raise RuntimeError('Original login is absent; refusing silent replacement')
+                # Stored paths and JSON history entries must follow the same root.
+                for (table,) in db.execute("select name from sqlite_master where type='table' and name not like 'sqlite_%'").fetchall():
+                    table_q = '"' + table.replace('"', '""') + '"'
+                    for col in db.execute('pragma table_info(' + table_q + ')').fetchall():
+                        if col[2].upper() not in ('TEXT', 'VARCHAR'): continue
+                        col_q = '"' + col[1].replace('"', '""') + '"'
+                        db.execute('update ' + table_q + ' set ' + col_q + '=replace(' + col_q + ', ?, ?) where instr(' + col_q + ', ?)>0', ('/data/', media + '/', '/data/'))
+                        if 'path' in col[1].lower():
+                            for folder in ('movies', 'tv', 'downloads'):
+                                db.execute('update ' + table_q + ' set ' + col_q + '=? where ' + col_q + '=?', (media + '/' + folder, '/' + folder))
+                db.execute('update ' + catalog + ' set Monitored=0')
+                db.execute('update Indexers set EnableRss=0, EnableAutomaticSearch=0, EnableInteractiveSearch=0')
+                db.execute('update DownloadClients set Enable=0')
+                for identity, implementation, raw in db.execute('select Id,Implementation,Settings from DownloadClients').fetchall():
+                    if implementation != 'QBittorrent': continue
+                    settings = json.loads(raw)
+                    settings.update(host='127.0.0.1', port=8080, useSsl=False, username=access['username'], password=access['password'])
+                    db.execute('update DownloadClients set Settings=? where Id=?', (json.dumps(settings), identity))
+                for identity, raw in db.execute('select Id,Settings from Indexers').fetchall():
+                    settings = json.loads(raw)
+                    if 'jackett' in str(settings.get('baseUrl', '')).lower() or ':9117' in str(settings.get('baseUrl', '')):
+                        from urllib.parse import urlsplit
+                        settings.update(baseUrl='http://127.0.0.1:9117' + urlsplit(settings['baseUrl']).path, apiKey=jackett['APIKey'])
+                        db.execute('update Indexers set Settings=? where Id=?', (json.dumps(settings), identity))
+                db.commit()
+                if db.execute('pragma integrity_check').fetchone()[0] != 'ok': raise RuntimeError('Imported database integrity check failed')
+                result['databases'][app] = {'catalog_entries': db.execute('select count(*) from ' + catalog).fetchone()[0], 'monitored': 0}
+                db.close(); target.chmod(0o600)
+        # Import only the source checkpoint queue, excluding cleanup backups.
+        source_bt = original / 'qbittorrent/qBittorrent/BT_backup'
+        records = list(source_bt.glob('*.fastresume'))
+        if len(records) != 5: raise RuntimeError('Expected exactly five retained paused torrents')
+        target_bt = ROOT / 'state/qbittorrent/qBittorrent/data/BT_backup'
+        target_bt.mkdir(parents=True, exist_ok=True)
+        if any(target_bt.glob('*.fastresume')): raise RuntimeError('Native queue is not empty')
+        for record in records:
+            values = bdecode(record.read_bytes())
+            values[b'paused'] = 1; values[b'auto_managed'] = 0
+            for key in (b'save_path', b'qBt-savePath', b'qBt-downloadPath'):
+                if key in values and isinstance(values[key], bytes):
+                    values[key] = values[key].replace(b'/data/', (media + '/').encode())
+            dest = target_bt / record.name
+            dest.write_bytes(bencode(values)); dest.chmod(0o600)
+            torrent = record.with_suffix('.torrent')
+            shutil.copyfile(torrent, target_bt / torrent.name)
+            (target_bt / torrent.name).chmod(0o600)
+        result['paused_torrents'] = len(records)
+        result['protected_torrent_hashes'] = sorted(record.stem.lower() for record in records)
+        # Keep all original Bazarr provider/language settings; retain the qualified
+        # native authentication and localhost integrations.
+        old_yaml = original / 'bazarr/config/config.yaml'
+        old_db = original / 'bazarr/db/bazarr.db'
+        if old_yaml.exists() and old_db.exists():
+            code = '''import sys,pathlib,yaml
+old=pathlib.Path(sys.argv[1]);new=pathlib.Path(sys.argv[2])
+a=yaml.safe_load(old.read_text());b=yaml.safe_load(new.read_text())
+for k in ('auth','sonarr','radarr'):a[k]=b[k]
+for k in ('ip','port','path_mappings','path_mappings_movie'):
+ if k in b.get('general',{}):a.setdefault('general',{})[k]=b['general'][k]
+new.write_text(yaml.safe_dump(a));new.chmod(0o600)
+'''
+            env = os.environ.copy();env['PYTHONPATH'] = str(ROOT / 'apps/bazarr/libs')
+            subprocess.run([str(ROOT / 'apps/bazarr-venv/bin/python'), '-c', code, str(old_yaml), str(ROOT / 'state/bazarr/config/config.yaml')], env=env, check=True)
+            dest = ROOT / 'state/bazarr/db/bazarr.db'
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            for suffix in ('-wal', '-shm'): pathlib.Path(str(dest) + suffix).unlink(missing_ok=True)
+            shutil.copy2(old_db, dest)
+            with contextlib.closing(sqlite3.connect(dest)) as db, db:
+                if db.execute('pragma quick_check').fetchone()[0] != 'ok': raise RuntimeError('Bazarr database invalid')
+                for (table,) in db.execute("select name from sqlite_master where type='table' and name not like 'sqlite_%'").fetchall():
+                    tq='"'+table.replace('"','""')+'"'
+                    for col in db.execute('pragma table_info('+tq+')').fetchall():
+                        if 'CHAR' not in col[2].upper() and col[2].upper()!='TEXT':continue
+                        cq='"'+col[1].replace('"','""')+'"'
+                        db.execute('update '+tq+' set '+cq+'=replace('+cq+',?,?) where instr('+cq+',?)>0',('/data/',media+'/', '/data/'))
+            result['bazarr'] = 'provider settings and database imported; automatic tasks remain off'
+        # Existing Jackett seed is already qualified; refresh provider records
+        # from the final restored checkpoint while keeping native server auth.
+        indexers = original / 'jackett/config/Jackett/Indexers'
+        if indexers.exists():
+            shutil.copytree(indexers, ROOT / 'state/jackett/Jackett/Indexers', dirs_exist_ok=True)
+            result['jackett'] = 'final provider records imported; native server configuration preserved'
+        save_json(receipt, result, private=True)
+    except Exception:
+        failed = snapshot / 'failed-state'
+        (ROOT / 'state').rename(failed)
+        shutil.copytree(snapshot / 'state', ROOT / 'state')
+        raise
+    print(json.dumps({k:v for k,v in result.items() if k != 'backup'}, indent=2))
+
+
+def bdecode(data):
+    offset = 0
+    def read():
+        nonlocal offset
+        prefix = data[offset:offset+1];offset += 1
+        if prefix == b'i':
+            end=data.index(b'e',offset);value=int(data[offset:end]);offset=end+1;return value
+        if prefix in (b'l',b'd'):
+            values=[]
+            while data[offset:offset+1] != b'e': values.append(read())
+            offset += 1
+            return dict(zip(values[::2],values[1::2])) if prefix==b'd' else values
+        offset-=1;end=data.index(b':',offset);length=int(data[offset:end]);offset=end+1
+        value=data[offset:offset+length];offset+=length;return value
+    result=read()
+    if offset != len(data): raise ValueError('Trailing bencode data')
+    return result
+
+
+def bencode(value):
+    if isinstance(value,int): return b'i'+str(value).encode()+b'e'
+    if isinstance(value,bytes): return str(len(value)).encode()+b':'+value
+    if isinstance(value,list): return b'l'+b''.join(bencode(x) for x in value)+b'e'
+    if isinstance(value,dict): return b'd'+b''.join(bencode(k)+bencode(value[k]) for k in sorted(value))+b'e'
+    raise TypeError(type(value))
+
+
+def install_headless():
+    """Build pinned upstream no-GUI qBittorrent; keep the existing profile."""
+    import shutil
+    version = '5.2.3'
+    commit = '0b63c3d17373f6132ea211c9dcd4241284ccdfaf'
+    source = ROOT / 'build' / ('qbittorrent-' + version)
+    target = ROOT / 'apps/qbittorrent-nox.app'
+    binary = target / 'Contents/MacOS/qbittorrent-nox'
+    if not binary.exists():
+        environment = os.environ.copy()
+        environment.update(HOMEBREW_NO_AUTO_UPDATE='1', HOMEBREW_NO_INSTALL_CLEANUP='1')
+        subprocess.run(['/opt/homebrew/bin/brew', 'install', 'cmake', 'ninja', 'qtbase', 'qttools', 'boost', 'openssl@3'], env=environment, check=True)
+        torrent_source = ROOT / 'build/libtorrent-2.0.15'
+        prefix = ROOT / 'apps/headless-deps'
+        if not torrent_source.exists():
+            torrent_source.parent.mkdir(parents=True, exist_ok=True)
+            subprocess.run(['git', 'clone', '--depth', '1', '--branch', 'v2.0.15', '--recurse-submodules', '--shallow-submodules',
+                            'https://github.com/arvidn/libtorrent.git', str(torrent_source)], check=True)
+        if subprocess.check_output(['git', '-C', str(torrent_source), 'rev-parse', 'HEAD'], text=True).strip() != '1eb18faeae156d8dbbab42935c082f8b81f50989':
+            raise RuntimeError('Unexpected libtorrent source revision')
+        subprocess.run(['/opt/homebrew/bin/cmake', '-S', str(torrent_source), '-B', str(torrent_source / 'build'), '-G', 'Ninja',
+                        '-DCMAKE_MAKE_PROGRAM=/opt/homebrew/bin/ninja', '-DCMAKE_BUILD_TYPE=Release', '-DBUILD_SHARED_LIBS=OFF',
+                        '-Dbuild_tests=OFF', '-Dbuild_examples=OFF', '-Dpython-bindings=OFF', '-DCMAKE_CXX_STANDARD=20',
+                        '-DCMAKE_INSTALL_PREFIX=' + str(prefix), '-DOPENSSL_ROOT_DIR=/opt/homebrew/opt/openssl@3'], check=True)
+        subprocess.run(['/opt/homebrew/bin/cmake', '--build', str(torrent_source / 'build'), '--parallel', '2'], check=True)
+        subprocess.run(['/opt/homebrew/bin/cmake', '--install', str(torrent_source / 'build')], check=True)
+        if not source.exists():
+            source.parent.mkdir(parents=True, exist_ok=True)
+            subprocess.run(['git', 'clone', '--depth', '1', '--branch', 'release-' + version,
+                            'https://github.com/qbittorrent/qBittorrent.git', str(source)], check=True)
+        actual = subprocess.check_output(['git', '-C', str(source), 'rev-parse', 'HEAD'], text=True).strip()
+        if actual != commit:
+            raise RuntimeError('Headless source revision differs from pinned upstream release')
+        subprocess.run(['/opt/homebrew/bin/cmake', '-S', str(source), '-B', str(source / 'build'), '-G', 'Ninja',
+                        '-DCMAKE_MAKE_PROGRAM=/opt/homebrew/bin/ninja', '-DCMAKE_BUILD_TYPE=Release',
+                        '-DGUI=OFF', '-DWEBUI=ON', '-DCMAKE_OSX_ARCHITECTURES=arm64',
+                        '-DQt6LinguistTools_DIR=/opt/homebrew/opt/qttools/lib/cmake/Qt6LinguistTools',
+                        '-DLibtorrentRasterbar_DIR=' + str(prefix / 'lib/cmake/LibtorrentRasterbar'),
+                        '-DCMAKE_CXX_FLAGS=-I' + str(prefix / 'include'),
+                        '-DOPENSSL_ROOT_DIR=/opt/homebrew/opt/openssl@3',
+                        '-DCMAKE_PREFIX_PATH=' + str(prefix) + ';/opt/homebrew/opt/qtbase;/opt/homebrew/opt/qttools;/opt/homebrew'], check=True)
+        subprocess.run(['/opt/homebrew/bin/cmake', '--build', str(source / 'build'), '--parallel', '2'], check=True)
+        built = source / 'build/qbittorrent-nox.app'
+        if not built.exists(): raise RuntimeError('Headless build output missing')
+        shutil.copytree(built, target)
+    if not (target / 'Contents/Frameworks').exists():
+        subprocess.run(['/opt/homebrew/bin/macdeployqt', str(target), '-no-strip'], check=True)
+    # Deployment tooling also collects desktop plugins. The no-GUI engine only
+    # needs networking/TLS and SQL plugins; avoid unrelated desktop loaders.
+    for name in ('iconengines', 'imageformats', 'platforms', 'styles'):
+        directory = target / 'Contents/PlugIns' / name
+        if directory.exists(): shutil.rmtree(directory)
+    subprocess.run(['codesign', '--force', '--deep', '-s', '-', str(target)], check=True)
+    qt_environment = {'QT_PLUGIN_PATH': str(target / 'Contents/PlugIns')}
+    output = subprocess.check_output([str(binary), '--version'], text=True, env={**os.environ, **qt_environment}).strip()
+    if version not in output: raise RuntimeError('Unexpected headless binary version')
+    links = subprocess.check_output(['/usr/bin/otool', '-L', str(binary)], text=True)
+    if 'QtGui' in links or 'QtWidgets' in links:
+        raise RuntimeError('Headless binary unexpectedly links Qt desktop libraries')
+    services_path = ROOT / 'state/services.json'
+    services = json.loads(services_path.read_text()) if services_path.exists() else {}
+    services.setdefault('qbittorrent', {})
+    services['qbittorrent']['command'] = [str(binary), '--profile=' + str(ROOT / 'state/qbittorrent'), '--webui-port=8080']
+    services['qbittorrent']['environment'] = qt_environment
+    save_json(services_path, services)
+    save_json(ROOT / 'checks/headless-build.json', {'version': output, 'upstream_commit': commit,
+              'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(), 'gui': False,
+              'architecture': 'arm64', 'library_links': links})
+    print('Native headless qBittorrent installed and selected; queue/profile preserved')
+
+
+def download_all_packages():
+    import concurrent.futures
+    for name in ("installers", "apps", "state", "logs", "checks"):
+        (ROOT / name).mkdir(parents=True, exist_ok=True)
+    ROOT.chmod(0o700)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        jobs = [pool.submit(download_jellyfin), pool.submit(download_native_packages)]
+        for job in jobs:
+            job.result()
+
+
+def prepare_native_services():
+    """Configure only installed native apps, all owned by the single supervisor."""
+    import shutil
+    qbittorrent = ROOT / 'apps/qbittorrent-nox.app/Contents/MacOS/qbittorrent-nox'
+    if not qbittorrent.exists():
+        raise RuntimeError("Native headless qBittorrent is required; run headless before staging services")
+    require_rebuild_state()
+    applications = pathlib.Path.home() / "Applications"
+    required = (applications / 'Sonarr.app/Contents/MacOS/Sonarr',
+                applications / 'Radarr.app/Contents/MacOS/Radarr', applications / 'Jellyfin.app',
+                ROOT / 'apps/Jackett/jackett', ROOT / 'apps/bazarr/bazarr.py')
+    if any(not path.exists() for path in required):
+        raise RuntimeError('All six native applications must be restored before staging service definitions')
+    state = ROOT / "state"
+    services = {}
+    for name in ("sonarr", "radarr"):
+        binary = applications / (name.title() + ".app") / "Contents/MacOS" / name.title()
+        if binary.exists():
+            bundle = applications / (name.title() + ".app")
+            check = subprocess.run(["codesign", "--verify", "--deep", "--strict", str(bundle)], capture_output=True)
+            if check.returncode:
+                subprocess.run(["codesign", "--force", "--deep", "-s", "-", str(bundle)], check=True)
+            services[name] = {"command": [str(binary), "-nobrowser", "-data=" + str(state / name)]}
+    jackett = ROOT / "apps/Jackett/jackett"
+    if jackett.exists():
+        config = state / "jackett/Jackett"
+        config.mkdir(parents=True, exist_ok=True)
+        services["jackett"] = {"command": [str(jackett), "--DataFolder", str(config),
+                                          "--NoUpdates", "--NoRestart"] +
+                                         ([] if (state / 'home-access.json').exists() else ['--ListenPublic']),
+                                "environment": {"XDG_CONFIG_HOME": str(state / "jackett")}}
+    qbittorrent = ROOT / 'apps/qbittorrent-nox.app/Contents/MacOS/qbittorrent-nox'
+    if qbittorrent.exists():
+        services["qbittorrent"] = {"command": [str(qbittorrent), "--profile=" + str(state / "qbittorrent"),
+                                              "--webui-port=8080"]}
+        if qbittorrent.name == "qbittorrent-nox":
+            services["qbittorrent"]["environment"] = {"QT_PLUGIN_PATH": str(ROOT / 'apps/qbittorrent-nox.app/Contents/PlugIns')}
+    bazarr = ROOT / "apps/bazarr/bazarr.py"
+    if bazarr.exists():
+        ensure_native_extractor()
+        venv = ROOT / "apps/bazarr-venv"
+        interpreter = venv / "bin/python"
+        if not interpreter.exists():
+            python = pathlib.Path.home() / ".local/share/mise/installs/python/3.13.16/bin/python3"
+            subprocess.run([str(python), "-m", "venv", str(venv)], check=True)
+        requirements = ROOT / "apps/bazarr/requirements.txt"
+        receipt = ROOT / "checks/bazarr-requirements.sha256"
+        digest = hashlib.sha256(requirements.read_bytes()).hexdigest()
+        if not receipt.exists() or receipt.read_text().strip() != digest:
+            install_bazarr_requirements(venv, requirements)
+            receipt.write_text(digest + "\n")
+        config = state / "bazarr"
+        services["bazarr"] = {"command": [str(interpreter), "-u", str(bazarr), "--config", str(config),
+                                         "--no-update", "--no-tasks"], "cwd": str(bazarr.parent),
+                               "environment": {"PATH": str(ROOT / "apps/native-tools") + ":" + str(applications / "Jellyfin.app/Contents/MacOS") + ":/opt/homebrew/bin:/usr/bin:/bin"}}
+        if (state / 'acquisition.json').exists() and json.loads((state / 'acquisition.json').read_text()).get('enabled'):
+            services['bazarr']['command'].remove('--no-tasks')
+    jellyfin = applications / "Jellyfin.app"
+    if jellyfin.exists():
+        candidates = [p for p in jellyfin.rglob("jellyfin") if p.is_file() and os.access(p, os.X_OK)]
+        ffmpegs = [p for p in jellyfin.rglob("ffmpeg") if p.is_file() and os.access(p, os.X_OK)]
+        webs = [p for p in jellyfin.rglob("jellyfin-web") if p.is_dir() and (p / "index.html").exists()]
+        if len(candidates) != 1 or len(ffmpegs) != 1 or len(webs) != 1:
+            raise RuntimeError("Unexpected Jellyfin app bundle layout")
+        services["jellyfin"] = {"command": [str(candidates[0]), "--datadir", str(state / "jellyfin/data"),
+                                           "--configdir", str(state / "jellyfin/config"),
+                                           "--cachedir", str(state / "jellyfin/cache"),
+                                           "--logdir", str(ROOT / "logs/jellyfin"),
+                                           "--webdir", str(webs[0]), "--ffmpeg", str(ffmpegs[0])]}
+    if (state / 'services.json').exists():
+        previous = json.loads((state / 'services.json').read_text())
+        if 'flaresolverr' in previous: services['flaresolverr'] = previous['flaresolverr']
+    save_json(state / "services.json", services)
+    print("Native services prepared: " + ", ".join(services))
+
+
+def ensure_native_extractor():
+    """Bazarr's bundled Mac 'arm64' UnRAR is Intel; use the official ARM build."""
+    import tarfile
+    archive = ROOT / "installers/unrar-arm-7.23.tar.gz"
+    expected = "68b393c000758d477fde43c955ff7542f12f76f3f5e87cdda923152fc791bd4d"
+    if not archive.exists():
+        subprocess.run(["curl", "--fail", "--location", "--silent", "--show-error", "--retry", "3",
+                        "--output", str(archive), "https://www.rarlab.com/rar/rarmacos-arm-723.tar.gz"], check=True)
+    if hashlib.file_digest(archive.open("rb"), "sha256").hexdigest() != expected:
+        raise RuntimeError("Native archive extractor package checksum mismatch")
+    tools = ROOT / "apps/native-tools"
+    tools.mkdir(exist_ok=True)
+    with tarfile.open(archive, "r:gz") as package:
+        content = package.extractfile("rar/unrar").read()
+    target = tools / "unrar"
+    if not target.exists() or hashlib.sha256(target.read_bytes()).digest() != hashlib.sha256(content).digest():
+        target.write_bytes(content); target.chmod(0o755)
+    result = subprocess.run([str(target)], capture_output=True, timeout=20)
+    if result.returncode:
+        raise RuntimeError("Native archive extractor could not execute")
+    save_json(ROOT / "checks/native-extractor.json", {"version": "7.23", "architecture": "arm64",
+              "source": "https://www.rarlab.com/rar/rarmacos-arm-723.tar.gz", "sha256": expected})
+
+
+def install_bazarr_requirements(venv, requirements):
+    """Use official, hash-checked ARM Python wheels; bounded concurrent downloads."""
+    import concurrent.futures
+    import math
+    import urllib.request
+    versions = {"setuptools": "84.0.0", "numpy": "2.3.5", "lxml": "6.1.3",
+                "Pillow": "12.3.0", "webrtcvad-wheels": "2.0.14.post1"}
+    wheels = ROOT / "installers/wheels"
+    wheels.mkdir(exist_ok=True)
+    def get_wheel(item):
+        name, version = item
+        with urllib.request.urlopen("https://pypi.org/pypi/" + name + "/" + version + "/json", timeout=60) as response:
+            metadata = json.load(response)
+        candidates = [f for f in metadata["urls"] if f["filename"].endswith(".whl") and (
+            f["filename"].endswith("py3-none-any.whl") or
+            ("-cp313-cp313-" in f["filename"] and "macosx" in f["filename"] and
+             ("arm64" in f["filename"] or "universal2" in f["filename"])))]
+        if len(candidates) > 1:
+            import re
+            import platform
+            current = tuple(int(p) for p in platform.mac_ver()[0].split(".")[:2])
+            def minimum_os(artifact):
+                match = re.search(r"macosx_(\d+)_(\d+)", artifact["filename"])
+                return tuple(map(int, match.groups())) if match else (0, 0)
+            candidates = sorted((f for f in candidates if minimum_os(f) <= current),
+                                key=minimum_os, reverse=True)[:1]
+        if len(candidates) != 1:
+            raise RuntimeError("Expected one matching native Bazarr wheel: " + name)
+        artifact = candidates[0]
+        dest = wheels / artifact["filename"]
+        if dest.exists() and hashlib.file_digest(dest.open("rb"), "sha256").hexdigest() == artifact["digests"]["sha256"]:
+            return
+        parts = wheels / (artifact["filename"] + ".parts")
+        parts.mkdir(exist_ok=True)
+        size = artifact["size"]
+        count = 8
+        chunk = math.ceil(size / count)
+        def fetch(i):
+            start, end = i * chunk, min(size - 1, (i + 1) * chunk - 1)
+            part = parts / str(i)
+            if part.exists() and part.stat().st_size == end - start + 1:
+                return
+            subprocess.run(["curl", "--fail", "--location", "--silent", "--show-error", "--retry", "3",
+                            "--connect-timeout", "30", "--range", str(start) + "-" + str(end),
+                            "--output", str(part), artifact["url"]], check=True)
+            if part.stat().st_size != end - start + 1:
+                raise RuntimeError("Wheel server did not honor bounded download range")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=count) as pool:
+            list(pool.map(fetch, range(count)))
+        temp = dest.with_suffix(".assembling")
+        with temp.open("wb") as out:
+            for i in range(count):
+                with (parts / str(i)).open("rb") as source:
+                    while block := source.read(1024 * 1024):
+                        out.write(block)
+        if temp.stat().st_size != size or hashlib.file_digest(temp.open("rb"), "sha256").hexdigest() != artifact["digests"]["sha256"]:
+            raise RuntimeError("Native wheel checksum mismatch: " + name)
+        temp.rename(dest)
+        print("Verified native dependency " + name, flush=True)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        list(pool.map(get_wheel, versions.items()))
+    subprocess.run([str(venv / "bin/pip"), "install", "--no-index", "--find-links", str(wheels),
+                    "-r", str(requirements)], check=True)
+
+
+def verify_retained_torrents(queue, profile):
+    """Protect imported records without restricting new, intentionally added work."""
+    receipt = json.loads((ROOT / 'checks/config-import.json').read_text())
+    hashes = receipt.get('protected_torrent_hashes')
+    if hashes is None:
+        original = pathlib.Path(profile['mountpoint']) / 'media_server/qbittorrent/qBittorrent/BT_backup'
+        hashes = [record.stem.lower() for record in original.glob('*.fastresume')]
+    expected = set(hashes)
+    if not expected or len(expected) != receipt['paused_torrents']:
+        raise RuntimeError('Cannot establish retained torrent identities; inspect the import receipt/source')
+    removal = ROOT / 'checks/removed-torrents.json'
+    decisions = json.loads(removal.read_text()) if removal.exists() else {}
+    removed = set(decisions.get('removed_hashes', []))
+    if not removed.issubset(expected):
+        raise RuntimeError('Recorded torrent removal includes an unknown original identity')
+    readded = set(decisions.get('readded_hashes', []))
+    if not readded.issubset(removed):
+        raise RuntimeError('Recorded re-download is not a previously removed original identity')
+    present = {item['hash'].lower() for item in queue}
+    if present & (removed - readded):
+        raise RuntimeError('An owner-deleted torrent reappeared without a recorded re-download')
+    protected = [item for item in queue if item['hash'].lower() in expected - readded]
+    if not (expected - removed).issubset({item['hash'].lower() for item in protected}):
+        raise RuntimeError('A protected original torrent is missing from the queue')
+    resume_dir = ROOT / 'state/qbittorrent/qBittorrent/data/BT_backup'
+    for item in protected:
+        if not item['state'].lower().startswith(('stopped', 'paused', 'missingfiles')):
+            raise RuntimeError('A protected original torrent is no longer stopped')
+        resume = bdecode((resume_dir / (item['hash'].lower() + '.fastresume')).read_bytes())
+        if resume.get(b'paused') != 1 or resume.get(b'auto_managed') != 0:
+            raise RuntimeError('A protected original torrent is not durably stopped')
+        if item.get('dlspeed') or item.get('upspeed'):
+            raise RuntimeError('A protected original torrent is unexpectedly transferring data')
+    return protected
+
+
+def verify_services():
+    """Verify interfaces and an actual short native VideoToolbox playback stream."""
+    import urllib.request
+    import urllib.parse
+    import http.cookiejar
+    import uuid
+    import xml.etree.ElementTree as ET
+    profile = json.loads((ROOT / "state/storage.json").read_text())
+    storage_check(profile)
+    wait_for_apps()
+    acquisition = (ROOT / 'state/acquisition.json').exists() and json.loads((ROOT / 'state/acquisition.json').read_text()).get('enabled', False)
+    result = {"native_apps": 7 if "flaresolverr" in json.loads((ROOT / "state/services.json").read_text()) else 6, "storage_mode": profile["mode"], "job_domain": job_domain(), "automatic_downloads": acquisition}
+    for app, port in (("sonarr", 8989), ("radarr", 7878)):
+        key = ET.parse(ROOT / "state" / app / "config.xml").findtext("ApiKey")
+        def arr(endpoint):
+            request = urllib.request.Request("http://127.0.0.1:" + str(port) + "/api/v3/" + endpoint,
+                                             headers={"X-Api-Key": key})
+            with urllib.request.urlopen(request, timeout=30) as response: return json.load(response)
+        indexers, clients = arr('indexer'), arr('downloadclient')
+        if acquisition:
+            assert any(i['enableRss'] and i['enableAutomaticSearch'] and i['enableInteractiveSearch'] for i in indexers)
+            assert any(c['enable'] for c in clients)
+        else:
+            assert all(not i['enableRss'] and not i['enableAutomaticSearch'] for i in indexers)
+            assert all(not c['enable'] for c in clients)
+        result[app + "_version"] = arr("system/status")["version"]
+        catalog = arr('movie' if app == 'radarr' else 'series')
+        result[app + '_catalog_count'] = len(catalog)
+        result[app + '_monitored'] = sum(bool(i.get('monitored')) for i in catalog)
+    access = json.loads((ROOT / 'state/access.json').read_text())
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+    request = urllib.request.Request('http://127.0.0.1:8080/api/v2/auth/login',
+                data=urllib.parse.urlencode(access).encode(), headers={'Referer': 'http://127.0.0.1:8080/'})
+    opener.open(request, timeout=20).close()
+    result['qbittorrent_version'] = opener.open('http://127.0.0.1:8080/api/v2/app/version', timeout=20).read().decode()
+    queue = json.load(opener.open('http://127.0.0.1:8080/api/v2/torrents/info', timeout=20))
+    result['torrent_count'] = len(queue)
+    result['torrent_states'] = [item['state'] for item in queue]
+    if profile['mode'] == 'external' and (ROOT / 'checks/config-import.json').exists():
+        protected = verify_retained_torrents(queue, profile)
+        result['protected_torrent_count'] = len(protected)
+        result['torrent_resume_flags_stopped'] = True
+        result['torrent_payloads_missing'] = sum(item['state'] == 'missingFiles' for item in protected)
+    auth = json.loads((ROOT / "state/jellyfin-auth.json").read_text())
+    headers = {"Authorization": 'MediaBrowser Token="' + auth["token"] + '", Client="Media Server Verification", '
+               'Device="Mac Studio", DeviceId="media-server-check", Version="1.0"'}
+    base = "http://127.0.0.1:8096"
+    def get(url):
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=90) as response:
+            return response.read()
+    deadline = time.monotonic() + 120
+    movies = []
+    while not movies and time.monotonic() < deadline:
+        data = json.loads(get(base + "/Items?Recursive=true&IncludeItemTypes=Movie&Fields=MediaSources&userId=" + auth["user_id"]))
+        movies = [i for i in data["Items"] if i.get("MediaSources") and pathlib.Path(i["MediaSources"][0].get("Path", "")).is_file()]
+        if not movies: time.sleep(2)
+    if not movies: raise RuntimeError("Jellyfin library scan has not produced playable movies")
+    movie = movies[0]
+    source = movie["MediaSources"][0]
+    session = uuid.uuid4().hex
+    query = urllib.parse.urlencode({"MediaSourceId": source["Id"], "DeviceId": "media-server-check",
+        "PlaySessionId": session, "VideoCodec": "h264", "AudioCodec": "aac", "VideoBitrate": 1500000,
+        "AudioBitrate": 128000, "MaxWidth": 1280, "MaxHeight": 720, "EnableAutoStreamCopy": "false",
+        "AllowVideoStreamCopy": "false", "SubtitleStreamIndex": -1, "TranscodingMaxAudioChannels": 2,
+        "SegmentContainer": "ts", "MinSegments": 1, "BreakOnNonKeyFrames": "true"})
+    master_url = base + "/Videos/" + movie["Id"] + "/master.m3u8?" + query
+    playback_started = time.time()
+    try:
+        master = get(master_url).decode()
+        playlist_url = urllib.parse.urljoin(master_url, next(l for l in master.splitlines() if l and not l.startswith("#")))
+        playlist = get(playlist_url).decode()
+        segment_url = urllib.parse.urljoin(playlist_url, next(l for l in playlist.splitlines() if l and not l.startswith("#")))
+        segment = get(segment_url)
+        target = ROOT / "checks/hardware-transcode-segment.ts"; target.write_bytes(segment)
+        ffprobe = pathlib.Path.home() / "Applications/Jellyfin.app/Contents/MacOS/ffprobe"
+        streams = json.loads(subprocess.check_output([str(ffprobe), "-v", "error", "-show_entries",
+            "stream=codec_type,codec_name,width,height", "-of", "json", str(target)]))["streams"]
+        logs = list((ROOT / "logs/jellyfin").glob("*FFmpeg*")) + list((ROOT / "logs/jellyfin").glob("*ffmpeg*"))
+        logs = [p for p in logs if p.stat().st_mtime >= playback_started
+                and source["Path"] in p.read_text(errors="replace")]
+        if not logs: raise RuntimeError("No FFmpeg log matched this verification playback")
+        log = max(logs, key=lambda p: p.stat().st_mtime)
+        text = log.read_text(errors="replace")
+        if "-hwaccel videotoolbox" not in text or "h264_videotoolbox" not in text:
+            raise RuntimeError("Playback did not demonstrate Apple hardware decode/encode")
+        if not any(s.get("codec_name") == "h264" and s.get("height") == 720 for s in streams):
+            raise RuntimeError("Hardware transcode segment is not playable 720p H.264")
+        result.update(source_movie=movie["Name"], target_streams=streams, segment_bytes=len(segment),
+                      hardware_decode=True, hardware_encode=True, ffmpeg_log=str(log))
+    finally:
+        stop = base + "/Videos/ActiveEncodings?" + urllib.parse.urlencode({"deviceId": "media-server-check", "playSessionId": session})
+        with contextlib.suppress(Exception):
+            urllib.request.urlopen(urllib.request.Request(stop, method="DELETE", headers=headers), timeout=20).close()
+    result["verified_at"] = time.time()
+    save_json(ROOT / ("checks/native-" + profile["mode"] + "-verification.json"), result)
+    print("Native interfaces verified; Apple hardware transcode produced playable 720p H.264/AAC")
+
+
+def wait_for_apps():
+    import urllib.request
+    ports = {"jellyfin": 8096, "sonarr": 8989, "radarr": 7878,
+             "bazarr": 6767, "jackett": 9117, "qbittorrent": 8080}
+    services = json.loads((ROOT / "state/services.json").read_text())
+    if 'flaresolverr' in services: ports['flaresolverr'] = 8191
+    if set(services) != set(ports):
+        raise RuntimeError("All six native applications must be installed before setup completes")
+    pending = set(services)
+    deadline = time.monotonic() + 180
+    while pending and time.monotonic() < deadline:
+        for name in list(pending):
+            with contextlib.suppress(OSError):
+                with socket.create_connection(("127.0.0.1", ports[name]), timeout=1):
+                    pending.remove(name)
+        if pending:
+            time.sleep(2)
+    if pending:
+        raise RuntimeError("Native apps unavailable: " + ", ".join(sorted(pending)))
+    print("All configured native application ports respond")
+
+def download_jellyfin():
+    import concurrent.futures,hashlib,math,pathlib,subprocess,time
+    R=ROOT / "installers"
+    url="https://fra1.mirror.jellyfin.org/files/server/macos/stable/v12.2/arm64/jellyfin_12.2-arm64.dmg"
+    size=164659012
+    expected="f6a4d13c1783667bc9c6c6de1bcec5d8c9537e5143ba44cda899cdf1cff83bc3"
+    dest=R/"jellyfin.dmg"
+    if dest.exists():return
+    parts=R/"jellyfin-parts";parts.mkdir(exist_ok=True)
+    count=12;chunk=math.ceil(size/count)
+    def fetch(i):
+     start=i*chunk;end=min(size-1,start+chunk-1);p=parts/str(i)
+     if p.exists() and p.stat().st_size==end-start+1:return
+     for attempt in range(3):
+      done=p.stat().st_size if p.exists() else 0
+      if done>end-start+1:p.unlink();done=0
+      temp=parts/(str(i)+".new")
+      proc=subprocess.run(["curl","--fail","--silent","--show-error","--connect-timeout","20","--range",str(start+done)+"-"+str(end),"--output",str(temp),url],capture_output=True)
+      if temp.exists():
+       with p.open("ab") as out,temp.open("rb") as src:out.write(src.read())
+       temp.unlink()
+      if p.stat().st_size==end-start+1:
+       print("Completed chunk",i+1,"of",count,flush=True);return
+      if p.stat().st_size>end-start+1:raise RuntimeError("Server ignored download range")
+      time.sleep(2)
+     raise RuntimeError("Incomplete chunk "+str(i))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=count) as pool:list(pool.map(fetch,range(count)))
+    with (R/"jellyfin.dmg.merging").open("wb") as out:
+     for i in range(count):
+      with (parts/str(i)).open("rb") as src:
+       while data:=src.read(1024*1024):out.write(data)
+    p=R/"jellyfin.dmg.merging"
+    assert p.stat().st_size==size
+    assert hashlib.file_digest(p.open("rb"),"sha256").hexdigest()==expected
+    p.rename(dest)
+    print("Jellyfin downloaded and checksum verified",flush=True)
+
+
+def download_native_packages():
+    import concurrent.futures,hashlib,json,math,pathlib,subprocess,time,urllib.request,urllib.parse
+    R=ROOT / "installers"
+    packages={
+     "sonarr.zip":("https://services.sonarr.tv/v1/download/main/latest?version=4&os=osx&arch=arm64&runtime=netcore&installer=true",64661024),
+     "radarr.zip":("https://radarr.servarr.com/v1/update/master/updatefile?os=osx&runtime=netcore&arch=arm64&installer=true",66635503),
+     "jackett.tar.gz":("https://github.com/Jackett/Jackett/releases/download/v0.24.2850/Jackett.Binaries.macOSARM64.tar.gz",47881503),
+     "bazarr.zip":("https://github.com/morpheus65535/bazarr/releases/download/v1.6.2/bazarr.zip",31023716)}
+    def package(item):
+     name,(url,expected_size)=item;dest=R/name
+     if dest.exists():return
+     metadata=urllib.request.urlopen(urllib.request.Request(url,headers={"Range":"bytes=0-0"}),timeout=60)
+     cr=metadata.headers.get("Content-Range","")
+     if not cr.startswith("bytes 0-0/"):raise RuntimeError("Range request unsupported: "+name)
+     size=int(cr.rsplit("/",1)[1]);etag=metadata.headers.get("ETag");effective=metadata.geturl();metadata.close()
+     if expected_size and size!=expected_size:raise RuntimeError("Package size changed: "+name)
+     parts=R/(name+"-parts");parts.mkdir(exist_ok=True)
+     manifest=parts/"manifest.json"
+     fresh={"url":url,"size":size,"etag":etag,"offset":(R/(name+".part")).stat().st_size if (R/(name+".part")).exists() else 0}
+     if manifest.exists():
+      old=json.loads(manifest.read_text())
+      if any(old.get(k)!=fresh[k] for k in ["url","size","etag"]):raise RuntimeError("Download identity changed: "+name)
+     else:manifest.write_text(json.dumps(fresh,indent=2))
+     prefix=R/(name+".part")
+     offset=json.loads(manifest.read_text()).get("offset",prefix.stat().st_size if prefix.exists() else 0)
+     count=8;chunk=math.ceil((size-offset)/count)
+     def fetch(i):
+      start=offset+i*chunk;end=min(size-1,start+chunk-1);p=parts/str(i)
+      if start>end:return
+      if p.exists() and p.stat().st_size==end-start+1:return
+      for attempt in range(3):
+       done=p.stat().st_size if p.exists() else 0
+       if done>end-start+1:raise RuntimeError("Oversize chunk: "+name)
+       temp=parts/(str(i)+".new")
+       args=["curl","--fail","--location","--silent","--show-error","--connect-timeout","30","--range",str(start+done)+"-"+str(end),"--output",str(temp),url]
+       if etag:args[1:1]=["--header","If-Range: "+etag]
+       result=subprocess.run(args,capture_output=True)
+       if temp.exists():
+        with p.open("ab") as out,temp.open("rb") as src:
+         while data:=src.read(1024*1024):out.write(data)
+        temp.unlink()
+       if p.exists() and p.stat().st_size==end-start+1:return
+       if p.exists() and p.stat().st_size>end-start+1:raise RuntimeError("Server ignored range: "+name)
+       time.sleep(2)
+      raise RuntimeError("Incomplete download: "+name)
+     with concurrent.futures.ThreadPoolExecutor(max_workers=count) as pool:list(pool.map(fetch,range(count)))
+     merged=R/(name+".merging")
+     with merged.open("wb") as out:
+      sources=([prefix] if offset else [])+[parts/str(i) for i in range(count) if (parts/str(i)).exists()]
+      for p in sources:
+       with p.open("rb") as src:
+        while data:=src.read(1024*1024):out.write(data)
+     assert merged.stat().st_size==size
+     merged.rename(dest);print("Downloaded",name,size,flush=True)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+     for future in concurrent.futures.as_completed([pool.submit(package,i) for i in packages.items()]):
+      try:future.result()
+      except Exception as exc:raise RuntimeError("Native package download failed") from exc
+
+
+def stage_native_apps():
+    import hashlib, json, pathlib, subprocess, tempfile, zipfile
+    R=ROOT
+    A=pathlib.Path.home()/"Applications"
+    A.mkdir(exist_ok=True)
+    expected={"jellyfin.dmg":"f6a4d13c1783667bc9c6c6de1bcec5d8c9537e5143ba44cda899cdf1cff83bc3"}
+    for name in ["jellyfin.dmg","sonarr.zip","radarr.zip","jackett.tar.gz","bazarr.zip"]:
+     p=R/"installers"/name
+     receipt=R/"checks"/(name+".installed.json")
+     if not p.exists() or receipt.exists():continue
+     h=hashlib.file_digest(open(p,"rb"),"sha256").hexdigest()
+     if name in expected and h!=expected[name]:raise RuntimeError("Package hash mismatch: "+name)
+     if name.endswith(".dmg"):
+      with tempfile.TemporaryDirectory(prefix="media-server-mount-") as m:
+       subprocess.run(["hdiutil","attach","-nobrowse","-readonly","-mountpoint",m,str(p)],check=True,stdout=subprocess.DEVNULL)
+       try:
+        apps=list(pathlib.Path(m).glob("*.app"))
+        assert len(apps)==1
+        subprocess.run(["ditto",str(apps[0]),str(A/apps[0].name)],check=True)
+       finally:subprocess.run(["hdiutil","detach",m],check=True,stdout=subprocess.DEVNULL)
+     elif name in ["sonarr.zip","radarr.zip"]:
+      subprocess.run(["ditto","-x","-k",str(p),str(A)],check=True)
+     elif name=="jackett.tar.gz":
+      subprocess.run(["tar","-xzf",str(p),"-C",str(R/"apps")],check=True)
+     else:
+      (R/"apps/bazarr").mkdir(exist_ok=True)
+      with zipfile.ZipFile(p) as z:z.extractall(R/"apps/bazarr")
+     receipt.write_text(json.dumps({"package":name,"sha256":h},indent=2))
+     print("Staged",name,flush=True)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:
+        print(type(exc).__name__ + ": " + str(exc), file=sys.stderr)
+        sys.exit(1)
