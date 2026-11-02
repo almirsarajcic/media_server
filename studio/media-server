@@ -1569,6 +1569,8 @@ def supervise():
                 held_targets = {name for name in app_names if service_held(name, lifecycle)}
                 if profile['mode'] == 'external':
                     services['settings-backup'] = {'command': [PYTHON, str(SCRIPT), 'backup-loop']}
+                if (ROOT / 'state/imdb-watchlists.json').exists() and not service_held('sonarr', lifecycle) and 'sonarr' not in paused_targets:
+                    services['imdb-watchlists'] = {'command': [PYTHON, str(ROOT / 'imdb-watchlists.py')]}
                 services.update(proxy_services())
                 mdns_path = ROOT / "state/mdns.json"
                 if mdns_path.exists():
@@ -1620,7 +1622,7 @@ def supervise():
                          "mdns": {n.removeprefix("mdns-"): p.pid for n, (p, _) in children.items()
                                   if n.startswith("mdns-")},
                          "proxy": {n: p.pid for n, (p, _) in children.items() if n.startswith("proxy-")},
-                         "workers": {n: p.pid for n, (p, _) in children.items() if n in ("settings-backup",)},
+                         "workers": {n: p.pid for n, (p, _) in children.items() if n in ("settings-backup", "imdb-watchlists")},
                          "services": lifecycle_service_status(app_names, children, endpoints, lifecycle, restart_after),
                          "intentional_stops": sorted(held_targets),
                          "control_operation": operation or lifecycle.get('last_result'),
