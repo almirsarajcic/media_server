@@ -89,3 +89,17 @@ Completion requires password-free app content from the home LAN, explicit denial
 ## Additional proxy sites
 
 Generated Caddy configuration imports `proxy-sites/*.caddy` under the runtime root, preserving separately maintained site definitions when media configuration is regenerated. Keep those definitions and their access policies under their own owners; the media LAN policy remains in the generated media blocks.
+
+## Individual and group service controls
+
+With the system supervisor running and storage verified, submit a scoped request from the installed controller:
+
+```sh
+~/.local/share/media-server/media-server control --service sonarr --action stop
+~/.local/share/media-server/media-server control --service sonarr --action start
+~/.local/share/media-server/media-server control --service media --action restart
+```
+
+Targets are `media` or one of `jellyfin`, `sonarr`, `radarr`, `jackett`, `bazarr`, `qbittorrent`, and `flaresolverr`; actions are `start`, `stop`, and `restart`. A media group start retains separately held individual services. Holds persist in private lifecycle state. Control waits for graceful exits and checks Arr activity before stopping; backups and lifecycle operations exclude each other. A pending result is not success: inspect `status`, resolve the ongoing operation, and repeat the same request to observe its result. It does not force-kill an operation merely because the client timed out. A verified storage failure remains an emergency gate and stops the owned stack.
+
+The separate `stop` command still establishes whole-stack maintenance, and `start` resumes that maintenance workflow. Check status and service endpoints after any action; local tests do not establish live runtime health.

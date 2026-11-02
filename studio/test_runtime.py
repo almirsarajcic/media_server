@@ -7,6 +7,7 @@ import plistlib
 import pwd
 import tempfile
 import time
+import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -256,6 +257,91 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(writes, [{'max_ratio_act': 0}])
         self.assertEqual(preferences['dl_limit'], 4096000)
         self.assertEqual(preferences['max_ratio'], 10)
+
+
+    def test_media_group_start_preserves_service_holds_and_restart_skips_them(self):
+        configured = set(m.MEDIA_SERVICE_IDS)
+        lifecycle = {'service_stops': ['sonarr'], 'media_stops': [], 'operation': None}
+        stopped, started = m.apply_control_intent(lifecycle, 'media', 'stop', configured)
+        self.assertEqual(set(stopped), configured)
+        self.assertEqual(started, [])
+        self.assertNotIn('sonarr', lifecycle['media_stops'])
+        _, started_by_group = m.apply_control_intent(lifecycle, 'media', 'start', configured)
+        self.assertEqual(set(started_by_group), configured - {'sonarr'})
+        self.assertEqual(lifecycle['service_stops'], ['sonarr'])
+        restarted, relaunched = m.apply_control_intent(lifecycle, 'media', 'restart', configured)
+        self.assertEqual(set(restarted), configured - {'sonarr'})
+        self.assertEqual(set(relaunched), configured - {'sonarr'})
+
+    def test_service_start_releases_only_its_own_hold(self):
+        lifecycle = {'service_stops': ['sonarr', 'radarr'], 'media_stops': ['jellyfin']}
+        stopped, started = m.apply_control_intent(lifecycle, 'sonarr', 'start', set(m.MEDIA_SERVICE_IDS))
+        self.assertEqual(stopped, [])
+        self.assertEqual(started, ['sonarr'])
+        self.assertEqual(lifecycle['service_stops'], ['radarr'])
+        self.assertEqual(lifecycle['media_stops'], ['jellyfin'])
+
+    def test_expired_control_request_is_rejected_without_changing_intent(self):
+        lifecycle = {'service_stops': ['sonarr'], 'media_stops': [], 'operation': None}
+        request = {'id': 'stale', 'service': 'radarr', 'action': 'stop',
+                   'created_at': time.time() - 20, 'expires_at': time.time() - 10}
+        result = m.accept_control_request(request, lifecycle, set(m.MEDIA_SERVICE_IDS), 123)
+        self.assertIsNone(result)
+        saved = m.load_lifecycle()
+        self.assertEqual(saved['service_stops'], ['sonarr'])
+        self.assertEqual(saved['media_stops'], [])
+        self.assertIsNone(saved['operation'])
+        self.assertEqual(saved['last_result']['status'], 'blocked')
+
+    def test_graceful_control_timeout_remains_pending_and_never_force_kills(self):
+        process = Mock(pid=4321)
+        process.poll.return_value = None
+        lifecycle = {'service_stops': [], 'media_stops': ['radarr'],
+                     'operation': {'id': 'op', 'service': 'media', 'action': 'stop',
+                                   'status': 'pending', 'phase': 'stopping',
+                                   'stop_targets': ['radarr'], 'start_targets': [],
+                                   'signalled': [], 'timeout_at': time.time() - 1}}
+        children = {'radarr': (process, None)}
+        with patch.object(m.os, 'killpg') as killpg, patch.object(m, 'process_group_exists', return_value=True):
+            guard, _ = m.progress_control_operation(lifecycle, children, None)
+        self.assertIsNone(guard)
+        self.assertEqual(lifecycle['operation']['status'], 'pending')
+        self.assertTrue(lifecycle['operation']['timed_out'])
+        killpg.assert_called_once_with(4321, m.signal.SIGTERM)
+        self.assertNotEqual(killpg.call_args.args[1], m.signal.SIGKILL)
+
+    def test_graceful_bazarr_stop_uses_its_sigint_shutdown_handler(self):
+        process = Mock(pid=4322)
+        process.poll.return_value = None
+        lifecycle = {'service_stops': ['bazarr'], 'media_stops': [],
+                     'operation': {'id': 'bazarr-stop', 'service': 'bazarr', 'action': 'stop',
+                                   'status': 'pending', 'phase': 'stopping',
+                                   'stop_targets': ['bazarr'], 'start_targets': [],
+                                   'signalled': [], 'timeout_at': time.time() + 60}}
+        children = {'bazarr': (process, None)}
+        with patch.object(m.os, 'killpg') as killpg, \
+                patch.object(m, 'process_group_exists', return_value=True), \
+                patch.object(m, 'service_health', return_value=False):
+            m.progress_control_operation(lifecycle, children, None)
+        killpg.assert_called_once_with(4322, m.signal.SIGINT)
+        self.assertEqual(lifecycle['operation']['status'], 'pending')
+
+    def test_all_intentionally_stopped_apps_are_not_reported_as_failed(self):
+        lifecycle = {'service_stops': [], 'media_stops': list(m.MEDIA_SERVICE_IDS), 'operation': None}
+        status = m.lifecycle_service_status(set(m.MEDIA_SERVICE_IDS), {}, {}, lifecycle, {})
+        self.assertEqual(set(status), set(m.MEDIA_SERVICE_IDS))
+        self.assertTrue(all(item['status'] == 'intentionally_stopped' for item in status.values()))
+        self.assertTrue(all(item['intentional_stop'] for item in status.values()))
+        self.assertTrue(all(item['endpoint_healthy'] is None for item in status.values()))
+
+    def test_reaped_child_pid_is_never_signalled_again(self):
+        process = Mock(pid=4321)
+        process.poll.return_value = 0
+        with patch.object(m.os, 'killpg') as killpg:
+            children = {'radarr': (process, None)}
+            m.stop_children(children)
+        killpg.assert_not_called()
+        self.assertEqual(children, {})
 
 
 if __name__ == '__main__':

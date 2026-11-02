@@ -14,6 +14,7 @@ import socket
 import subprocess
 import sys
 import time
+import uuid
 
 if __name__ == "__main__" and sys.version_info < (3, 11):
     interpreter = "/opt/homebrew/bin/python3.14"
@@ -28,6 +29,65 @@ SCRIPT = ROOT / "media-server"
 PLIST = pathlib.Path.home() / "Library/LaunchAgents" / (LABEL + ".plist")
 DOMAIN = "gui/" + str(os.getuid())
 DAEMON_PLIST = pathlib.Path('/Library/LaunchDaemons') / (LABEL + '.plist')
+MEDIA_SERVICE_IDS = ('jellyfin', 'sonarr', 'radarr', 'jackett', 'bazarr', 'qbittorrent', 'flaresolverr')
+SERVICE_PORTS = {'jellyfin': 8096, 'sonarr': 8989, 'radarr': 7878, 'jackett': 9117,
+                 'bazarr': 6767, 'qbittorrent': 8080, 'flaresolverr': 8191}
+
+
+def lifecycle_path():
+    return ROOT / 'state/lifecycle.json'
+
+
+def load_lifecycle():
+    path = lifecycle_path()
+    if not path.exists():
+        return {'service_stops': [], 'media_stops': [], 'operation': None,
+                'last_result': None}
+    state = json.loads(path.read_text())
+    if not isinstance(state, dict):
+        raise RuntimeError('Lifecycle state is invalid; inspect private state before retrying')
+    state.setdefault('service_stops', [])
+    state.setdefault('media_stops', [])
+    state.setdefault('operation', None)
+    state.setdefault('last_result', None)
+    return state
+
+
+def service_held(name, lifecycle):
+    return name in lifecycle.get('service_stops', []) or name in lifecycle.get('media_stops', [])
+
+
+def apply_control_intent(lifecycle, service, action, configured):
+    """Persist only requested intent; return the services this operation must affect."""
+    configured = [name for name in MEDIA_SERVICE_IDS if name in configured]
+    explicit = set(lifecycle.get('service_stops', []))
+    grouped = set(lifecycle.get('media_stops', []))
+    if service != 'media' and service not in configured:
+        raise RuntimeError('Requested media service is not configured: ' + service)
+    if service == 'media':
+        if action == 'stop':
+            grouped |= set(configured) - explicit
+            stop_targets, start_targets = configured, []
+        elif action == 'start':
+            grouped.clear()
+            stop_targets = []
+            start_targets = [name for name in configured if name not in explicit]
+        else:
+            stop_targets = start_targets = [name for name in configured if name not in explicit and name not in grouped]
+    elif action == 'stop':
+        explicit.add(service)
+        stop_targets, start_targets = [service], []
+    elif action == 'start':
+        explicit.discard(service)
+        grouped.discard(service)
+        stop_targets, start_targets = [], [service]
+    else:
+        explicit.discard(service)
+        grouped.discard(service)
+        stop_targets = start_targets = [service]
+    lifecycle['service_stops'] = sorted(explicit)
+    lifecycle['media_stops'] = sorted(grouped)
+    return stop_targets, start_targets
 
 
 def is_storage_gate_failure(error):
@@ -41,6 +101,45 @@ def is_storage_gate_failure(error):
         'Required media directory', 'Media directory points outside',
         'Media filesystem verification',
     ))
+
+
+def operation_guard(shared=False, nonblocking=True):
+    """Lock shared with backup writers and exclusive to lifecycle operations."""
+    path = ROOT / 'state/control-operation.lock'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open('a')
+    os.fchmod(handle.fileno(), 0o600)
+    flags = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
+    if nonblocking:
+        flags |= fcntl.LOCK_NB
+    try:
+        fcntl.flock(handle.fileno(), flags)
+    except BlockingIOError:
+        handle.close()
+        return None
+    return handle
+
+
+def release_operation_guard(handle):
+    if handle is not None:
+        with contextlib.suppress(OSError, ValueError):
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        with contextlib.suppress(OSError, ValueError):
+            handle.close()
+
+
+def backup_guard():
+    handle = operation_guard(shared=True)
+    if handle is None:
+        raise RuntimeError('A media lifecycle operation is in progress; retry the backup after it completes')
+    try:
+        operation = load_lifecycle().get('operation')
+        if operation and operation.get('status') == 'pending':
+            raise RuntimeError('A pending media lifecycle operation needs recovery before backup')
+    except Exception:
+        release_operation_guard(handle)
+        raise
+    return handle
 
 
 def job_domain():
@@ -72,6 +171,91 @@ def health():
     return result
 
 
+def service_health(name, timeout=1.0):
+    """Probe one app endpoint without exposing credentials or changing its state."""
+    import urllib.error
+    import urllib.request
+    port = SERVICE_PORTS.get(name)
+    if port is None:
+        return False
+    try:
+        with urllib.request.urlopen('http://127.0.0.1:' + str(port) + '/', timeout=timeout) as response:
+            return response.status < 500
+    except urllib.error.HTTPError as error:
+        return error.code in (401, 403)
+    except (OSError, urllib.error.URLError):
+        return False
+
+
+def active_arr_commands(app):
+    """Read the configured Arr API and report imports/commands without exposing its key."""
+    import urllib.request
+    import urllib.parse
+    import xml.etree.ElementTree as ET
+    ports = {'sonarr': 8989, 'radarr': 7878}
+    if app not in ports:
+        return []
+    try:
+        key = ET.parse(ROOT / 'state' / app / 'config.xml').findtext('ApiKey')
+        if not key:
+            raise RuntimeError('API key is missing')
+        base = 'http://127.0.0.1:' + str(ports[app]) + '/api/v3/'
+        def get(path):
+            request = urllib.request.Request(base + path, headers={'X-Api-Key': key})
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return json.loads(response.read())
+        commands = get('command')
+        if not isinstance(commands, list):
+            raise RuntimeError('Command response is invalid')
+        active = []
+        for command in commands:
+            if not isinstance(command, dict) or not isinstance(command.get('status'), str):
+                raise RuntimeError('Command response is incomplete')
+            status = command['status'].lower()
+            if status in {'queued', 'started', 'running', 'delayed', 'pending', 'waiting'}:
+                active.append({'name': str(command.get('name', 'unknown')),
+                               'status': status, 'id': command.get('id')})
+        # Arr reports download import activity separately from its command queue.
+        page = 1
+        while True:
+            query = urllib.parse.urlencode({'page': page, 'pageSize': 100,
+                                            'includeUnknownMovieItems': 'true'})
+            queue = get('queue?' + query)
+            if not isinstance(queue, dict) or not isinstance(queue.get('records'), list):
+                raise RuntimeError('Queue response is invalid')
+            records = queue['records']
+            for item in records:
+                if not isinstance(item, dict):
+                    raise RuntimeError('Queue response is incomplete')
+                state = str(item.get('trackedDownloadState', item.get('status', ''))).lower()
+                if state in {'importpending', 'importing', 'importpendingfailed'}:
+                    active.append({'name': 'Download import', 'status': state,
+                                   'id': item.get('id')})
+            total = queue.get('totalRecords', len(records))
+            if not isinstance(total, int) or len(records) < 100 or page * 100 >= total:
+                break
+            page += 1
+        return active
+    except RuntimeError:
+        raise
+    except Exception as error:
+        # Fail closed: an unreadable Arr queue is not evidence that shutdown is safe.
+        raise RuntimeError(app.capitalize() + ' active commands could not be checked') from error
+
+
+def require_arr_idle(targets, children=None):
+    for app in ('sonarr', 'radarr'):
+        if app not in targets:
+            continue
+        # A down/held Arr instance has no live command queue to inspect. If it
+        # is still owned or answering, require its private API to confirm idle.
+        if not ((children and app in children) or service_health(app)):
+            continue
+        active = active_arr_commands(app)
+        if active:
+            raise RuntimeError(app.capitalize() + ' has active command(s); wait for imports and commands to finish')
+
+
 def rotate_logs():
     # Copy/truncate keeps the descriptors held by launchd and child apps valid.
     import shutil
@@ -87,13 +271,17 @@ def rotate_logs():
 
 def backup_state(force=False):
     """Allow one settings snapshot writer at a time, including manual backups."""
-    with (ROOT / 'state/backup.lock').open('a') as lock:
-        os.fchmod(lock.fileno(), 0o600)
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as error:
-            raise RuntimeError('Settings backup already in progress; retry after it finishes') from error
-        return _backup_state(force)
+    guard = backup_guard()
+    try:
+        with (ROOT / 'state/backup.lock').open('a') as lock:
+            os.fchmod(lock.fileno(), 0o600)
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise RuntimeError('Settings backup already in progress; retry after it finishes') from error
+            return _backup_state(force)
+    finally:
+        release_operation_guard(guard)
 
 
 def _backup_state(force=False):
@@ -124,7 +312,9 @@ def _backup_state(force=False):
         relative = source.relative_to(ROOT / 'state')
         if source.is_symlink() or not source.is_file(): continue
         if any(p.lower() in ('cache', 'logs', 'metadata', 'mediacover', 'transcodes', 'backups', 'caddy-data', 'caddy-config') for p in relative.parts): continue
-        if source.name.endswith(('-wal', '-shm', '.lock', '.new')) or source.name in ('status.json', 'supervisor.lock'): continue
+        if source.name.endswith(('-wal', '-shm', '.lock', '.new')) or source.name in (
+                'status.json', 'supervisor.lock', 'control-request.json', 'control-inflight.json'):
+            continue
         storage_check(profile)
         target = partial / 'state' / relative
         target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -159,9 +349,14 @@ def _backup_state(force=False):
 
 def backup_loop():
     while True:
-        try: backup_state()
-        except Exception as error: print('Backup failed: ' + str(error), flush=True)
-        time.sleep(3600)
+        delay = 3600
+        try:
+            backup_state()
+        except Exception as error:
+            print('Backup failed: ' + str(error), flush=True)
+            if 'media lifecycle operation is in progress' in str(error):
+                delay = 30
+        time.sleep(delay)
 
 
 def restore_original_logins():
@@ -454,6 +649,16 @@ def ensure_download_import_safety():
 
 
 def test_recovery():
+    guard = operation_guard()
+    if guard is None:
+        raise RuntimeError('A backup or media lifecycle operation is active; retry storage recovery later')
+    try:
+        _test_recovery()
+    finally:
+        release_operation_guard(guard)
+
+
+def _test_recovery():
     profile_path = ROOT / 'state/storage.json'
     original = json.loads(profile_path.read_text())
     state_path = ROOT / 'state/status.json'
@@ -664,17 +869,344 @@ def bounded_storage_paths_check(profile):
 def stop_children(children):
     """Only our own process groups; no dependence on a removed media volume."""
     for process, _ in children.values():
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(process.pid, signal.SIGTERM)
+        if process.poll() is None:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGTERM)
     deadline = time.monotonic() + 20
     while any(p.poll() is None for p, _ in children.values()) and time.monotonic() < deadline:
         time.sleep(0.2)
     for process, _ in children.values():
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(process.pid, signal.SIGKILL)
+        # A live Popen child has not been reaped, so its PID cannot have been reused.
+        if process.poll() is None:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
         with contextlib.suppress(subprocess.TimeoutExpired):
             process.wait(timeout=2)
     children.clear()
+
+
+def process_group_exists(pgid):
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def graceful_signal(name):
+    """Use the installed app's normal shutdown signal; Bazarr handles SIGINT."""
+    return signal.SIGINT if name == 'bazarr' else signal.SIGTERM
+
+
+def save_lifecycle(lifecycle):
+    save_json(lifecycle_path(), lifecycle, private=True)
+
+
+def record_control_result(lifecycle, request, status, message):
+    result = {'id': request.get('id'), 'service': request.get('service'),
+              'action': request.get('action'), 'status': status, 'message': message,
+              'updated_at': time.time()}
+    lifecycle['last_result'] = result
+    save_lifecycle(lifecycle)
+    return result
+
+
+def consume_control_request():
+    request_path = ROOT / 'state/control-request.json'
+    inflight_path = ROOT / 'state/control-inflight.json'
+    if not inflight_path.exists() and request_path.exists():
+        try:
+            request_path.replace(inflight_path)
+        except FileNotFoundError:
+            return None, None
+    if not inflight_path.exists():
+        return None, None
+    try:
+        return json.loads(inflight_path.read_text()), inflight_path
+    except (OSError, ValueError):
+        inflight_path.unlink(missing_ok=True)
+        return {'id': 'invalid', 'service': 'unknown', 'action': 'unknown', 'expires_at': 0}, inflight_path
+
+
+def backup_is_active():
+    path = ROOT / 'state/backup.lock'
+    if not path.exists():
+        return False
+    with path.open('a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        return False
+
+
+def accept_control_request(request, lifecycle, configured, supervisor_pid, children=None):
+    """Validate and persist one request. The supervisor remains the only process owner."""
+    if request.get('expires_at', 0) <= time.time():
+        record_control_result(lifecycle, request, 'blocked',
+                              'Control request expired before the supervisor accepted it; no service state changed.')
+        return None
+    if lifecycle.get('operation') and lifecycle['operation'].get('status') == 'pending':
+        record_control_result(lifecycle, request, 'blocked',
+                              'Another media lifecycle operation is still pending.')
+        return None
+    service, action = request.get('service'), request.get('action')
+    if service not in ('media', *MEDIA_SERVICE_IDS) or action not in ('start', 'stop', 'restart'):
+        record_control_result(lifecycle, request, 'blocked', 'Invalid lifecycle request; no service state changed.')
+        return None
+    guard = None
+    try:
+        # Commit intent only after all safety checks.
+        intent = dict(lifecycle)
+        stop_targets, start_targets = apply_control_intent(intent, service, action, configured)
+        if stop_targets:
+            require_arr_idle(stop_targets, children=children)
+        if (ROOT / 'state/maintenance').exists():
+            raise RuntimeError('Whole-stack maintenance is active')
+        guard = operation_guard()
+        if guard is None:
+            raise RuntimeError('A backup or another lifecycle operation is in progress')
+        if backup_is_active():
+            raise RuntimeError('A settings backup is in progress')
+        intent['operation'] = {
+            'id': request['id'], 'service': service, 'action': action, 'status': 'pending',
+            'phase': 'stopping' if stop_targets else 'starting',
+            'stop_targets': stop_targets, 'start_targets': start_targets,
+            'signalled': [], 'supervisor_pid': supervisor_pid,
+            'requested_at': request.get('created_at', time.time()),
+            'timeout_at': request.get('expires_at', time.time()),
+            'updated_at': time.time(), 'timed_out': False,
+        }
+        intent['last_result'] = None
+        save_lifecycle(intent)
+        return guard
+    except Exception as error:
+        release_operation_guard(guard)
+        record_control_result(lifecycle, request, 'blocked', str(error))
+        return None
+
+
+def finish_control_operation(lifecycle, operation, operation_guard_handle, message):
+    operation['status'] = 'complete'
+    operation['phase'] = 'complete'
+    operation['message'] = message
+    operation['completed_at'] = time.time()
+    lifecycle['last_result'] = operation
+    lifecycle['operation'] = None
+    save_lifecycle(lifecycle)
+    release_operation_guard(operation_guard_handle)
+    return None
+
+
+def progress_control_operation(lifecycle, children, operation_guard_handle):
+    operation = lifecycle.get('operation')
+    if not operation or operation.get('status') != 'pending':
+        return operation_guard_handle, set()
+    waiting_external = set()
+    now = time.time()
+    if now >= operation.get('timeout_at', now + 1) and not operation.get('timed_out'):
+        operation['timed_out'] = True
+        operation['message'] = 'Timed out waiting; the graceful operation remains pending and will continue without force-killing.'
+        operation['updated_at'] = now
+        save_lifecycle(lifecycle)
+    if operation.get('phase') == 'stopping':
+        still_waiting = False
+        signalled = set(operation.get('signalled', []))
+        for name in operation.get('stop_targets', []):
+            child = children.get(name)
+            if child:
+                proc, _ = child
+                if name not in signalled:
+                    # Do not signal a reaped PID. A live Popen child pins its PID until wait/poll.
+                    if proc.poll() is None:
+                        try:
+                            os.killpg(proc.pid, graceful_signal(name))
+                        except ProcessLookupError:
+                            pass
+                    signalled.add(name)
+                    operation['signalled'] = sorted(signalled)
+                    operation['updated_at'] = time.time()
+                    save_lifecycle(lifecycle)
+                if proc.poll() is None or process_group_exists(proc.pid):
+                    still_waiting = True
+                    continue
+                with contextlib.suppress(Exception):
+                    proc.wait(timeout=0)
+                children.pop(name, None)
+            if service_health(name):
+                still_waiting = True
+                waiting_external.add(name)
+        if still_waiting:
+            return operation_guard_handle, waiting_external
+        if operation.get('action') == 'restart':
+            operation['phase'] = 'starting'
+            operation['updated_at'] = time.time()
+            save_lifecycle(lifecycle)
+        else:
+            operation_guard_handle = finish_control_operation(
+                lifecycle, operation, operation_guard_handle,
+                'Requested media service stop completed after normal process termination.')
+            return operation_guard_handle, waiting_external
+    if operation.get('phase') == 'starting':
+        all_ready = True
+        for name in operation.get('start_targets', []):
+            child = children.get(name)
+            if child is None:
+                if service_health(name):
+                    waiting_external.add(name)
+                all_ready = False
+                continue
+            proc, _ = child
+            if proc.poll() is not None or not service_health(name):
+                all_ready = False
+        if all_ready:
+            operation_guard_handle = finish_control_operation(
+                lifecycle, operation, operation_guard_handle,
+                'Requested media service start completed and its endpoint is responding.')
+        else:
+            operation['updated_at'] = now
+            save_lifecycle(lifecycle)
+    return operation_guard_handle, waiting_external
+
+
+def lifecycle_service_status(configured, children, endpoints, lifecycle, restart_after):
+    result = {}
+    explicit = set(lifecycle.get('service_stops', []))
+    grouped = set(lifecycle.get('media_stops', []))
+    operation = lifecycle.get('operation') or {}
+    for name in sorted(configured):
+        held_by = []
+        if name in explicit:
+            held_by.append('service')
+        if name in grouped:
+            held_by.append('media')
+        child = children.get(name)
+        intentional = bool(held_by)
+        if intentional and child:
+            status = 'stopping'
+        elif intentional:
+            status = 'intentionally_stopped'
+        elif child and endpoints.get(name, False):
+            status = 'healthy'
+        elif child:
+            status = 'starting'
+        elif name in restart_after:
+            status = 'retrying'
+        elif operation.get('phase') == 'starting' and name in operation.get('start_targets', []):
+            status = 'starting'
+        else:
+            status = 'failed'
+        result[name] = {'desired': 'stopped' if intentional else 'running', 'status': status,
+                        'intentional_stop': intentional, 'held_by': held_by,
+                        'pid': child[0].pid if child else None,
+                        'endpoint_healthy': bool(endpoints.get(name, False)) if not intentional else None,
+                        'retry_at': time.time() + max(0, restart_after[name] - time.monotonic()) if name in restart_after else None}
+    return result
+
+
+def control_wait_result(operation_id, timeout):
+    deadline = time.monotonic() + timeout
+    while True:
+        lifecycle = load_lifecycle()
+        operation = lifecycle.get('operation')
+        result = lifecycle.get('last_result')
+        if operation and operation.get('id') == operation_id and operation.get('status') in ('complete', 'blocked'):
+            return operation
+        if result and result.get('id') == operation_id and result.get('status') in ('complete', 'blocked'):
+            return result
+        if time.monotonic() >= deadline:
+            return {'id': operation_id, 'status': 'pending', 'timed_out': True,
+                    'recoverable': True,
+                    'message': 'Timed out waiting; the supervisor keeps the graceful operation pending and will not force-kill.'}
+        time.sleep(0.25)
+
+
+def control_command(service, action, timeout):
+    """Submit one atomic request and report JSON; only the supervisor changes child processes."""
+    def result(status, message, **details):
+        return {'ok': status == 'complete', 'status': status, 'service': service,
+                'action': action, 'message': message, **details}
+    if action not in ('start', 'stop', 'restart') or service not in ('media', *MEDIA_SERVICE_IDS):
+        return result('blocked', 'Invalid service or action.'), 2
+    if not isinstance(timeout, int) or timeout < 1 or timeout > 600:
+        return result('blocked', 'Timeout must be between 1 and 600 seconds.'), 2
+    state_dir = ROOT / 'state'
+    client_lock = None
+    try:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        client_lock = (state_dir / 'control-client.lock').open('a')
+        os.fchmod(client_lock.fileno(), 0o600)
+        fcntl.flock(client_lock, fcntl.LOCK_EX)
+    except OSError:
+        if client_lock is not None:
+            client_lock.close()
+        return result('blocked', 'Controller state is unavailable; no service action was submitted.'), 2
+    operation_id = None
+    try:
+        if (state_dir / 'maintenance').exists():
+            return result('blocked', 'Whole-stack maintenance is active.'), 2
+        try:
+            loaded = launchctl('print', 'system/' + LABEL, capture_output=True)
+        except (OSError, subprocess.SubprocessError):
+            return result('blocked', 'The system media supervisor could not be checked.'), 2
+        if loaded.returncode:
+            return result('blocked', 'The system media supervisor is not loaded.'), 2
+        try:
+            current = load_lifecycle().get('operation')
+        except (OSError, ValueError, RuntimeError):
+            return result('blocked', 'Lifecycle state is unavailable; no service action was submitted.'), 2
+        if current and current.get('status') == 'pending':
+            if current.get('service') != service or current.get('action') != action:
+                return result('blocked', 'Another lifecycle operation is pending.',
+                              operation_id=current.get('id'), recoverable=True), 2
+            operation_id = current['id']
+            observed = control_wait_result(current['id'], timeout)
+            status = observed.get('status', 'pending')
+            if status == 'complete':
+                details = {'operation_id': current['id']}
+                return result('complete', observed.get('message', 'Lifecycle operation completed.'),
+                              **details), 0
+            return result('pending', observed.get('message', 'Lifecycle operation is still pending.'),
+                          operation_id=current['id'], recoverable=True), 2
+        request_id = uuid.uuid4().hex
+        operation_id = request_id
+        request = {'id': request_id, 'service': service, 'action': action,
+                   'created_at': time.time(), 'expires_at': time.time() + timeout}
+        request_path = state_dir / 'control-request.json'
+        if request_path.exists() or (state_dir / 'control-inflight.json').exists():
+            return result('blocked', 'A previous control request has not been reconciled.'), 2
+        save_json(request_path, request, private=True)
+        observed = control_wait_result(request_id, timeout)
+        if observed.get('status') == 'pending':
+            withdrawn = False
+            try:
+                queued = json.loads(request_path.read_text()) if request_path.exists() else None
+                if queued and queued.get('id') == request_id:
+                    request_path.unlink()
+                    withdrawn = True
+            except (OSError, ValueError):
+                pass
+            if withdrawn:
+                return result('blocked', 'Supervisor did not accept the request before timeout; it was withdrawn and no desired state changed.',
+                              operation_id=request_id), 2
+            return result('pending', observed['message'], operation_id=request_id, recoverable=True), 2
+        if observed.get('status') == 'complete':
+            details = {'operation_id': request_id}
+            return result('complete', observed.get('message', 'Lifecycle operation completed.'),
+                          **details), 0
+        return result('blocked', observed.get('message', 'Lifecycle operation was blocked.'),
+                      operation_id=request_id), 2
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+        if operation_id:
+            return result('pending', 'Control state could not be confirmed; inspect status before retrying.',
+                          operation_id=operation_id, recoverable=True), 2
+        return result('blocked', 'Control state is unavailable; no service action was submitted.'), 2
+    finally:
+        fcntl.flock(client_lock, fcntl.LOCK_UN)
+        client_lock.close()
 
 
 MDNS_PORTS = {"jellyfin": 8096, "sonarr": 8989, "radarr": 7878,
@@ -895,6 +1427,7 @@ def supervise():
     restart_after = {}
     last_health = 0
     endpoints = {}
+    operation_lock_handle = None
     def stop_signal(_signum, _frame):
         nonlocal stopping
         stopping = True
@@ -911,6 +1444,32 @@ def supervise():
                 if not services:
                     raise RuntimeError("No native media applications are configured")
                 app_names = set(services)
+                lifecycle = load_lifecycle()
+                operation = lifecycle.get('operation')
+                if operation and operation.get('status') == 'pending' and operation_lock_handle is None:
+                    operation_lock_handle = operation_guard()
+                request, inflight_path = consume_control_request()
+                if request is not None:
+                    try:
+                        operation_lock_handle = accept_control_request(
+                            request, lifecycle, app_names, os.getpid(), children) or operation_lock_handle
+                    finally:
+                        if inflight_path:
+                            inflight_path.unlink(missing_ok=True)
+                    lifecycle = load_lifecycle()
+                    operation = lifecycle.get('operation')
+                if operation and operation.get('status') == 'pending' and operation_lock_handle is None:
+                    waiting_external = set(operation.get('stop_targets', [])) | set(operation.get('start_targets', []))
+                else:
+                    operation_lock_handle, waiting_external = progress_control_operation(
+                        lifecycle, children, operation_lock_handle)
+                operation = lifecycle.get('operation')
+                paused_targets = set()
+                if operation and operation.get('status') == 'pending' and operation.get('phase') == 'stopping':
+                    paused_targets.update(operation.get('stop_targets', []))
+                if operation and operation.get('status') == 'pending' and operation_lock_handle is None:
+                    paused_targets.update(operation.get('start_targets', []))
+                held_targets = {name for name in app_names if service_held(name, lifecycle)}
                 if profile['mode'] == 'external':
                     services['settings-backup'] = {'command': [PYTHON, str(SCRIPT), 'backup-loop']}
                 services.update(proxy_services())
@@ -919,16 +1478,23 @@ def supervise():
                     services.update(mdns_services(json.loads(mdns_path.read_text())))
                 for name in list(children):
                     proc, signature = children[name]
+                    if name in app_names and (name in held_targets or name in paused_targets):
+                        if proc.poll() is not None and not process_group_exists(proc.pid):
+                            with contextlib.suppress(Exception):
+                                proc.wait(timeout=0)
+                            children.pop(name, None)
+                        continue
                     expected = json.dumps(services.get(name), sort_keys=True)
                     if name not in services or signature != expected:
                         subset = {name: children.pop(name)}; stop_children(subset)
                     elif proc.poll() is not None:
-                        with contextlib.suppress(ProcessLookupError):
-                            os.killpg(proc.pid, signal.SIGKILL)
                         children.pop(name)
-                        restart_after[name] = time.monotonic() + 30
-                        print(name + " exited; retrying after 30 seconds", flush=True)
-                for name, settings in services.items():
+                        if name not in held_targets and name not in paused_targets:
+                            restart_after[name] = time.monotonic() + 30
+                            print(name + " exited; retrying after 30 seconds", flush=True)
+                managed_services = {name: settings for name, settings in services.items()
+                                     if name not in held_targets and name not in paused_targets and name not in waiting_external}
+                for name, settings in managed_services.items():
                     if name in children or time.monotonic() < restart_after.get(name, 0):
                         continue
                     # Check immediately before each start, including process-crash recovery.
@@ -942,22 +1508,51 @@ def supervise():
                                                 start_new_session=True)
                     children[name] = (proc, json.dumps(settings, sort_keys=True))
                     print("Started " + name + " after storage verification", flush=True)
-                if time.monotonic() - last_health >= 30:
+                if time.monotonic() - last_health >= 30 or (operation and operation.get('phase') == 'starting'):
                     endpoints = health()
                     rotate_logs()
                     last_health = time.monotonic()
-                ready = len(children.keys() & app_names) == len(app_names) and all(endpoints.get(n, False) for n in app_names)
+                desired_names = app_names - held_targets
+                ready = all(n in children and endpoints.get(n, False) for n in desired_names)
                 message = "Native media stack " + ('healthy' if ready else 'starting or degraded') + " on verified " + profile["mode"] + " storage"
+                operation_lock_handle, waiting_external = progress_control_operation(
+                    lifecycle, children, operation_lock_handle)
+                operation = lifecycle.get('operation')
                 state = {"phase": "running" if ready else "degraded", "endpoints": endpoints, "storage_mode": profile["mode"],
                          "supervisor_pid": os.getpid(), "apps": {n: p.pid for n, (p, _) in children.items() if n in app_names},
                          "mdns": {n.removeprefix("mdns-"): p.pid for n, (p, _) in children.items()
                                   if n.startswith("mdns-")},
                          "proxy": {n: p.pid for n, (p, _) in children.items() if n.startswith("proxy-")},
-                         "workers": {n: p.pid for n, (p, _) in children.items() if n == "settings-backup"}}
+                         "workers": {n: p.pid for n, (p, _) in children.items() if n in ("settings-backup",)},
+                         "services": lifecycle_service_status(app_names, children, endpoints, lifecycle, restart_after),
+                         "intentional_stops": sorted(held_targets),
+                         "control_operation": operation or lifecycle.get('last_result')}
             except (RuntimeError, OSError, ValueError, KeyError, subprocess.TimeoutExpired) as exc:
-                stop_children(children)
+                lifecycle = load_lifecycle()
+                operation = lifecycle.get('operation')
+                pending_control = bool(operation and operation.get('status') == 'pending')
+                emergency_storage_failure = str(exc) != 'Intentional maintenance stop' and (
+                    not pending_control or is_storage_gate_failure(exc))
+                if emergency_storage_failure:
+                    # Retain the existing hard-stop safety for a failed storage gate.
+                    stop_children(children)
+                else:
+                    # A maintenance request must never turn an in-flight graceful request into SIGKILL.
+                    for name, (proc, _) in children.items():
+                        if proc.poll() is None:
+                            with contextlib.suppress(ProcessLookupError):
+                                os.killpg(proc.pid, graceful_signal(name))
+                    for name, (proc, _) in list(children.items()):
+                        if proc.poll() is not None and not process_group_exists(proc.pid):
+                            with contextlib.suppress(Exception):
+                                proc.wait(timeout=0)
+                            children.pop(name, None)
                 message = "Media startup blocked: " + str(exc)
-                state = {"phase": "maintenance" if (ROOT / 'state/maintenance').exists() else "blocked", "reason": str(exc), "supervisor_pid": os.getpid(), "apps": {}}
+                state = {"phase": "maintenance" if (ROOT / 'state/maintenance').exists() else "blocked", "reason": str(exc),
+                         "supervisor_pid": os.getpid(), "apps": {n: p.pid for n, (p, _) in children.items() if n in MEDIA_SERVICE_IDS},
+                         "services": lifecycle_service_status(set(MEDIA_SERVICE_IDS), children, {}, lifecycle, restart_after),
+                         "intentional_stops": sorted(set(lifecycle.get('service_stops', [])) | set(lifecycle.get('media_stops', []))),
+                         "control_operation": operation or lifecycle.get('last_result')}
             if message != last_message:
                 print(message, flush=True); last_message = message
             state["checked_at"] = time.time()
@@ -967,8 +1562,28 @@ def supervise():
                 if stopping: break
                 time.sleep(1)
     finally:
-        stop_children(children)
-        save_json(ROOT / "state/status.json", {"phase": "stopped", "apps": {}, "checked_at": time.time()})
+        lifecycle = load_lifecycle()
+        operation = lifecycle.get('operation')
+        if operation and operation.get('status') == 'pending':
+            for name, (proc, _) in children.items():
+                if proc.poll() is None:
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(proc.pid, graceful_signal(name))
+            while any(proc.poll() is None or process_group_exists(proc.pid)
+                      for proc, _ in children.values()):
+                state = {'phase': 'stopping', 'apps': {name: proc.pid for name, (proc, _) in children.items()},
+                         'control_operation': operation, 'checked_at': time.time()}
+                save_json(ROOT / 'state/status.json', state)
+                time.sleep(0.2)
+            for proc, _ in children.values():
+                with contextlib.suppress(Exception):
+                    proc.wait(timeout=0)
+            save_json(ROOT / 'state/status.json', {'phase': 'stopped', 'apps': {},
+                      'control_operation': operation, 'checked_at': time.time()})
+        else:
+            stop_children(children)
+            save_json(ROOT / "state/status.json", {"phase": "stopped", "apps": {}, "checked_at": time.time()})
+        release_operation_guard(operation_lock_handle)
         lock.close()
 
 
@@ -1079,26 +1694,53 @@ def register_external(uuid, mountpoint, media_root):
 
 
 def stop_supervisor():
-    (ROOT / 'state/maintenance').touch(mode=0o600)
-    deadline = time.monotonic() + 45
-    while time.monotonic() < deadline:
-        state = json.loads((ROOT / 'state/status.json').read_text())
-        if state.get('phase') == 'maintenance' and not state.get('apps') and time.time() - state.get('checked_at', 0) < 10:
-            print('All media processes stopped; boot supervisor retains durable maintenance hold')
-            return
-        time.sleep(0.5)
-    raise RuntimeError('System supervisor has not confirmed maintenance stop')
+    state_dir = ROOT / 'state'
+    state_dir.mkdir(parents=True, exist_ok=True)
+    client_lock = (state_dir / 'control-client.lock').open('a')
+    os.fchmod(client_lock.fileno(), 0o600)
+    try:
+        try:
+            fcntl.flock(client_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RuntimeError('A media control command is active; retry maintenance after it completes') from error
+        guard = operation_guard()
+        if guard is None:
+            raise RuntimeError('A backup or media lifecycle operation is active; no maintenance hold was written')
+        try:
+            current = load_lifecycle().get('operation')
+            if current and current.get('status') == 'pending':
+                raise RuntimeError('A media lifecycle operation is active; no maintenance hold was written')
+            if (state_dir / 'control-request.json').exists() or (state_dir / 'control-inflight.json').exists():
+                raise RuntimeError('A media control request is pending; no maintenance hold was written')
+            (state_dir / 'maintenance').touch(mode=0o600)
+            deadline = time.monotonic() + 45
+            while time.monotonic() < deadline:
+                status_path = state_dir / 'status.json'
+                state = json.loads(status_path.read_text()) if status_path.exists() else {}
+                if state.get('phase') == 'maintenance' and not state.get('apps') and time.time() - state.get('checked_at', 0) < 10:
+                    print('All media processes stopped; boot supervisor retains durable maintenance hold')
+                    return
+                time.sleep(0.5)
+            raise RuntimeError('System supervisor has not confirmed maintenance stop')
+        finally:
+            release_operation_guard(guard)
+    finally:
+        fcntl.flock(client_lock.fileno(), fcntl.LOCK_UN)
+        client_lock.close()
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["packages", "stage", "start", "stop", "run", "check", "status", "storage", "verify", "mdns", "proxy", "headless", "prepare-boot", "backup", "backup-loop", "import-configs", "test-recovery", "solver", "acquisition", "restore-logins", "home-access"])
+    parser.add_argument("command", choices=["packages", "stage", "start", "stop", "run", "check", "status", "storage", "verify", "mdns", "proxy", "headless", "prepare-boot", "backup", "backup-loop", "import-configs", "test-recovery", "solver", "acquisition", "restore-logins", "home-access", "control"])
     parser.add_argument("--uuid")
     parser.add_argument("--mountpoint")
     parser.add_argument("--media-root")
     parser.add_argument("--network", help="Actual private IPv4 home subnet, for password-free management")
     parser.add_argument("--interface", default="en1", help="Studio LAN interface for mDNS")
     parser.add_argument("--disable", action="store_true", help="Disable the selected mDNS or proxy feature")
+    parser.add_argument("--service", choices=('media', *MEDIA_SERVICE_IDS), help="Lifecycle target for control")
+    parser.add_argument("--action", choices=('start', 'stop', 'restart'), help="Lifecycle action for control")
+    parser.add_argument("--timeout", type=int, default=120, help="Control wait limit in seconds (default: 120)")
     args = parser.parse_args()
     if args.command in ('stage', 'headless', 'solver'):
         require_stopped()
@@ -1143,9 +1785,31 @@ def main():
         install_startup()
     elif args.command == "stop":
         stop_supervisor()
+    elif args.command == 'control':
+        if not args.service or not args.action:
+            result = {'ok': False, 'status': 'blocked', 'service': args.service,
+                      'action': args.action, 'message': 'Control requires --service and --action.'}
+            print(json.dumps(result, separators=(',', ':')))
+            raise SystemExit(2)
+        result, exit_code = control_command(args.service, args.action, args.timeout)
+        print(json.dumps(result, separators=(',', ':')))
+        if exit_code:
+            raise SystemExit(exit_code)
     elif args.command == "status":
         path = ROOT / "state/status.json"
         state = json.loads(path.read_text()) if path.exists() else {'phase': 'not_started'}
+        try:
+            lifecycle = load_lifecycle()
+            configured = set(json.loads((ROOT / 'state/services.json').read_text()))
+            state['services'] = lifecycle_service_status(
+                configured, {name: (type('StatusProcess', (), {'pid': pid})(), None)
+                             for name, pid in state.get('apps', {}).items()},
+                state.get('endpoints', {}), lifecycle, {})
+            state['intentional_stops'] = sorted(
+                set(lifecycle.get('service_stops', [])) | set(lifecycle.get('media_stops', [])))
+            state['control_operation'] = lifecycle.get('operation') or lifecycle.get('last_result')
+        except (OSError, ValueError, RuntimeError):
+            pass
         state['job_loaded'] = launchctl('print', job_domain() + '/' + LABEL, capture_output=True).returncode == 0
         state['job_domain'] = job_domain()
         if state.get('phase') in ('running', 'degraded', 'maintenance', 'blocked') and (not state['job_loaded'] or time.time() - state.get('checked_at', 0) > 90):
