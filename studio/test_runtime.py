@@ -7,8 +7,11 @@ import plistlib
 import pwd
 import tempfile
 import time
+import threading
 import time
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from unittest.mock import Mock, patch
 
 loader = importlib.machinery.SourceFileLoader('controller', str(pathlib.Path(__file__).with_name('media-server')))
@@ -405,6 +408,39 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(saved['last_result']['restored_temporary_hold_id'], 'host-op')
         finally:
             m.release_operation_guard(guard)
+
+
+    def test_service_health_follows_jackett_cookie_redirect(self):
+        class JackettHandler(BaseHTTPRequestHandler):
+            saw_cookie = False
+
+            def do_GET(self):
+                if self.path == '/':
+                    self.send_response(302)
+                    self.send_header('Set-Cookie', 'anti-forgery=token; Path=/')
+                    self.send_header('Location', '/dashboard')
+                elif self.path == '/dashboard' and 'anti-forgery=token' in self.headers.get('Cookie', ''):
+                    type(self).saw_cookie = True
+                    self.send_response(200)
+                else:
+                    self.send_response(400)
+                self.send_header('Content-Length', '0')
+                self.end_headers()
+
+            def log_message(self, _format, *_args):
+                pass
+
+        server = HTTPServer(('127.0.0.1', 0), JackettHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with patch.dict(m.SERVICE_PORTS, {'jackett': server.server_port}):
+                self.assertTrue(m.service_health('jackett', timeout=2))
+            self.assertTrue(JackettHandler.saw_cookie)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
 
 
 if __name__ == '__main__':

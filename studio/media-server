@@ -212,11 +212,13 @@ def service_health(name, timeout=1.0):
     """Probe one app endpoint without exposing credentials or changing its state."""
     import urllib.error
     import urllib.request
+    import http.cookiejar
     port = SERVICE_PORTS.get(name)
     if port is None:
         return False
     try:
-        with urllib.request.urlopen('http://127.0.0.1:' + str(port) + '/', timeout=timeout) as response:
+        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+        with opener.open('http://127.0.0.1:' + str(port) + '/', timeout=timeout) as response:
             return response.status < 500
     except urllib.error.HTTPError as error:
         return error.code in (401, 403)
