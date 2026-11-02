@@ -30,6 +30,19 @@ DOMAIN = "gui/" + str(os.getuid())
 DAEMON_PLIST = pathlib.Path('/Library/LaunchDaemons') / (LABEL + '.plist')
 
 
+def is_storage_gate_failure(error):
+    if isinstance(error, (OSError, subprocess.TimeoutExpired)):
+        return True
+    message = str(error)
+    return message.startswith((
+        'A registered external storage profile', 'Expected media volume',
+        'Media volume UUID', 'External storage profile', 'Media root is outside',
+        'Stable application media path', 'Media storage marker',
+        'Required media directory', 'Media directory points outside',
+        'Media filesystem verification',
+    ))
+
+
 def job_domain():
     return 'system'
 
@@ -561,6 +574,13 @@ def storage_check(profile, mount=False):
         raise RuntimeError("Expected media volume is not mounted at its configured location")
     if not info.get("WritableVolume", False):
         raise RuntimeError("Expected media volume is read-only")
+    bounded_storage_paths_check(profile)
+    return info
+
+
+def storage_paths_check(profile):
+    """Filesystem checks run only in the disposable probe process."""
+    expected_mount = pathlib.Path(profile["mountpoint"])
     device = expected_mount.stat().st_dev
     media = pathlib.Path(profile["media_root"])
     if profile["mode"] == "external" and not media.resolve().is_relative_to(expected_mount.resolve()):
@@ -578,7 +598,67 @@ def storage_check(profile, mount=False):
             raise RuntimeError("Media directory points outside the verified media root")
         if not os.access(directory, os.W_OK):
             raise RuntimeError("Required media directory is not writable: " + name)
-    return info
+
+
+_STORAGE_PROBE = None
+_STORAGE_PROBE_TIMEOUT = 8.0
+_STORAGE_PROBE_CODE = """
+import json, pathlib, runpy, sys
+controller = runpy.run_path(sys.argv[1])
+request = json.load(sys.stdin)
+controller['storage_paths_check'].__globals__['ROOT'] = pathlib.Path(request['root'])
+try:
+    controller['storage_paths_check'](request['profile'])
+except (OSError, RuntimeError, ValueError) as error:
+    print(json.dumps({'error': str(error)}))
+    raise SystemExit(1)
+print('{}')
+"""
+
+
+def bounded_storage_paths_check(profile):
+    """Keep a stalled external open from freezing lifecycle/status updates.
+
+    At most one probe may remain in kernel I/O. A timed-out probe is killed,
+    but the supervisor never waits indefinitely for that kill to complete.
+    Storage remains blocked until a later full verification succeeds.
+    """
+    global _STORAGE_PROBE
+    if _STORAGE_PROBE is not None:
+        if _STORAGE_PROBE.poll() is None:
+            raise RuntimeError('Media filesystem verification is still blocked')
+        _STORAGE_PROBE = None
+    process = subprocess.Popen(
+        [sys.executable, '-I', '-c', _STORAGE_PROBE_CODE, str(pathlib.Path(__file__).resolve())],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        start_new_session=True, close_fds=True,
+    )
+    _STORAGE_PROBE = process
+    try:
+        output, _ = process.communicate(
+            json.dumps({'root': str(ROOT), 'profile': profile}).encode(),
+            timeout=_STORAGE_PROBE_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(ProcessLookupError):
+            process.kill()
+        try:
+            process.communicate(timeout=0.2)
+        except subprocess.TimeoutExpired:
+            pass
+        raise RuntimeError('Media filesystem verification timed out') from None
+    finally:
+        if process.poll() is not None:
+            _STORAGE_PROBE = None
+    if len(output) > 4096:
+        raise RuntimeError('Media filesystem verification returned invalid output')
+    try:
+        result = json.loads(output)
+    except (ValueError, UnicodeError):
+        raise RuntimeError('Media filesystem verification failed') from None
+    if process.returncode or result != {}:
+        raise RuntimeError(result.get('error', 'Media filesystem verification failed')
+                           if isinstance(result, dict) else 'Media filesystem verification failed')
 
 
 def stop_children(children):

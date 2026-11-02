@@ -107,3 +107,25 @@ class BootAndLogTests(unittest.TestCase):
 
 if __name__ == '__main__':
  unittest.main()
+
+class ProbeDeadlineTests(unittest.TestCase):
+ def test_stalled_helper_returns_promptly_and_is_reaped(self):
+  import time
+  with patch.object(m, '_STORAGE_PROBE_CODE', 'import time; time.sleep(60)'), patch.object(m, '_STORAGE_PROBE_TIMEOUT', .05):
+   start=time.monotonic()
+   with self.assertRaisesRegex(RuntimeError, 'timed out'):
+    m.bounded_storage_paths_check({})
+   self.assertLess(time.monotonic()-start, 1.5)
+   self.assertIsNone(m._STORAGE_PROBE)
+ def test_unfinished_previous_probe_suppresses_new_process(self):
+  from unittest.mock import Mock
+  pending=Mock(); pending.poll.return_value=None
+  with patch.object(m, '_STORAGE_PROBE', pending), patch.object(m.subprocess, 'Popen') as spawn:
+   with self.assertRaisesRegex(RuntimeError, 'still blocked'):
+    m.bounded_storage_paths_check({})
+   spawn.assert_not_called()
+
+class ProbeStorageSafetyTests(unittest.TestCase):
+ def test_probe_failure_remains_storage_failure_during_pending_control(self):
+  for message in ('Media filesystem verification timed out', 'Media filesystem verification is still blocked', 'Media filesystem verification failed'):
+   self.assertTrue(m.is_storage_gate_failure(RuntimeError(message)))

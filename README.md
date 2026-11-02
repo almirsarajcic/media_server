@@ -7,6 +7,7 @@ This repository maintains an existing, host-specific installation. It is not a t
 ## Start here
 
 - [Operate and update the Studio](docs/operations.md): start/stop, storage checks, backups, logs and recovery.
+- [External storage recovery](docs/storage-recovery.md): bounded checks and recovery after a stalled volume.
 - [Installation and rebuild prerequisites](docs/installation.md): native dependencies, boot service and deliberate installation steps.
 - [Migrate restored configurations](docs/migration.md): offline database import, path conversion and stopped download queues.
 - [Downloads appearing in Jellyfin](docs/imports.md): import notifications, movie identity and refresh checks.
