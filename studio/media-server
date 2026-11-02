@@ -42,7 +42,7 @@ def load_lifecycle():
     path = lifecycle_path()
     if not path.exists():
         return {'service_stops': [], 'media_stops': [], 'operation': None,
-                'last_result': None}
+                'last_result': None, 'resume_on_boot': None}
     state = json.loads(path.read_text())
     if not isinstance(state, dict):
         raise RuntimeError('Lifecycle state is invalid; inspect private state before retrying')
@@ -50,6 +50,7 @@ def load_lifecycle():
     state.setdefault('media_stops', [])
     state.setdefault('operation', None)
     state.setdefault('last_result', None)
+    state.setdefault('resume_on_boot', None)
     return state
 
 
@@ -88,6 +89,42 @@ def apply_control_intent(lifecycle, service, action, configured):
     lifecycle['service_stops'] = sorted(explicit)
     lifecycle['media_stops'] = sorted(grouped)
     return stop_targets, start_targets
+
+
+def host_boot_id():
+    """Return the OS boot identity; unlike a supervisor PID it survives job restarts."""
+    result = subprocess.run(['/usr/sbin/sysctl', '-n', 'kern.boottime'],
+                            capture_output=True, text=True, timeout=3)
+    value = result.stdout.strip()
+    if result.returncode or not value:
+        raise RuntimeError('The current macOS boot identity is unavailable')
+    return value
+
+
+def reconcile_resume_on_boot(lifecycle, current_boot_id=None):
+    """Release only a temporary group hold, and only after the OS actually rebooted."""
+    marker = lifecycle.get('resume_on_boot')
+    if not isinstance(marker, dict):
+        return False
+    if current_boot_id is None:
+        try:
+            current_boot_id = host_boot_id()
+        except (OSError, RuntimeError, subprocess.TimeoutExpired):
+            return False
+    previous_boot_id = marker.get('boot_id')
+    if not previous_boot_id or current_boot_id == previous_boot_id:
+        return False
+    created_holds = set(marker.get('created_holds', []))
+    lifecycle['media_stops'] = sorted(set(lifecycle.get('media_stops', [])) - created_holds)
+    lifecycle['resume_on_boot'] = None
+    lifecycle['last_result'] = {
+        'id': marker.get('id'), 'service': 'media', 'action': 'stop',
+        'status': 'resumed_after_boot',
+        'message': 'Temporary media hold cleared after a new macOS boot; prior service and group holds were preserved.',
+        'updated_at': time.time(),
+    }
+    save_lifecycle(lifecycle)
+    return True
 
 
 def is_storage_gate_failure(error):
@@ -959,9 +996,34 @@ def accept_control_request(request, lifecycle, configured, supervisor_pid, child
         return None
     guard = None
     try:
-        # Commit intent only after all safety checks.
+        temporary_id = request.get('restore_temporary')
+        marker = lifecycle.get('resume_on_boot')
+        if marker and not (service == 'media' and action == 'start' and temporary_id == marker.get('id')):
+            raise RuntimeError('A temporary host-shutdown hold is active; restore it by its returned hold ID or reboot the Mac')
+        if temporary_id and not (service == 'media' and action == 'start'):
+            raise RuntimeError('--restore-temporary is allowed only with --service media --action start')
+        if request.get('resume_on_boot') and not (service == 'media' and action == 'stop'):
+            raise RuntimeError('--resume-on-boot is allowed only with --service media --action stop')
+        if request.get('resume_on_boot') and temporary_id:
+            raise RuntimeError('--resume-on-boot and --restore-temporary cannot be combined')
+        boot_id = host_boot_id() if request.get('resume_on_boot') else None
+        # Intent is only committed after all safety checks, so a refused request changes nothing.
         intent = dict(lifecycle)
-        stop_targets, start_targets = apply_control_intent(intent, service, action, configured)
+        prior_grouped = set(lifecycle.get('media_stops', []))
+        if temporary_id:
+            if not isinstance(marker, dict) or marker.get('id') != temporary_id:
+                raise RuntimeError('Temporary hold ID is not current; no service state changed')
+            created_holds = set(marker.get('created_holds', []))
+            explicit = set(lifecycle.get('service_stops', []))
+            grouped = set(lifecycle.get('media_stops', [])) - created_holds
+            intent['media_stops'] = sorted(grouped)
+            stop_targets = []
+            start_targets = [name for name in MEDIA_SERVICE_IDS
+                             if name in configured and name in created_holds
+                             and name not in explicit and name not in grouped]
+            intent['resume_on_boot'] = None
+        else:
+            stop_targets, start_targets = apply_control_intent(intent, service, action, configured)
         if stop_targets:
             require_arr_idle(stop_targets, children=children)
         if (ROOT / 'state/maintenance').exists():
@@ -976,6 +1038,11 @@ def accept_control_request(request, lifecycle, configured, supervisor_pid, child
             'phase': 'stopping' if stop_targets else 'starting',
             'stop_targets': stop_targets, 'start_targets': start_targets,
             'signalled': [], 'supervisor_pid': supervisor_pid,
+            'resume_on_boot': bool(request.get('resume_on_boot')),
+            'host_boot_id': boot_id,
+            'temporary_created_holds': sorted(set(intent.get('media_stops', [])) - prior_grouped)
+                if request.get('resume_on_boot') else [],
+            'restore_temporary_hold_id': temporary_id,
             'requested_at': request.get('created_at', time.time()),
             'timeout_at': request.get('expires_at', time.time()),
             'updated_at': time.time(), 'timed_out': False,
@@ -994,6 +1061,15 @@ def finish_control_operation(lifecycle, operation, operation_guard_handle, messa
     operation['phase'] = 'complete'
     operation['message'] = message
     operation['completed_at'] = time.time()
+    if operation.get('resume_on_boot'):
+        marker = {'id': operation['id'], 'boot_id': operation['host_boot_id'],
+                  'created_holds': operation.get('temporary_created_holds', []),
+                  'created_at': operation['completed_at']}
+        lifecycle['resume_on_boot'] = marker
+        operation['temporary_hold_id'] = marker['id']
+        operation['temporary_hold_services'] = marker['created_holds']
+    if operation.get('restore_temporary_hold_id'):
+        operation['restored_temporary_hold_id'] = operation['restore_temporary_hold_id']
     lifecycle['last_result'] = operation
     lifecycle['operation'] = None
     save_lifecycle(lifecycle)
@@ -1124,7 +1200,7 @@ def control_wait_result(operation_id, timeout):
         time.sleep(0.25)
 
 
-def control_command(service, action, timeout):
+def control_command(service, action, timeout, resume_on_boot=False, restore_temporary=None):
     """Submit one atomic request and report JSON; only the supervisor changes child processes."""
     def result(status, message, **details):
         return {'ok': status == 'complete', 'status': status, 'service': service,
@@ -1133,6 +1209,12 @@ def control_command(service, action, timeout):
         return result('blocked', 'Invalid service or action.'), 2
     if not isinstance(timeout, int) or timeout < 1 or timeout > 600:
         return result('blocked', 'Timeout must be between 1 and 600 seconds.'), 2
+    if resume_on_boot and not (service == 'media' and action == 'stop'):
+        return result('blocked', '--resume-on-boot is allowed only with --service media --action stop.'), 2
+    if restore_temporary and not (service == 'media' and action == 'start'):
+        return result('blocked', '--restore-temporary is allowed only with --service media --action start.'), 2
+    if resume_on_boot and restore_temporary:
+        return result('blocked', '--resume-on-boot and --restore-temporary cannot be combined.'), 2
     state_dir = ROOT / 'state'
     client_lock = None
     try:
@@ -1159,7 +1241,9 @@ def control_command(service, action, timeout):
         except (OSError, ValueError, RuntimeError):
             return result('blocked', 'Lifecycle state is unavailable; no service action was submitted.'), 2
         if current and current.get('status') == 'pending':
-            if current.get('service') != service or current.get('action') != action:
+            if (current.get('service') != service or current.get('action') != action
+                    or bool(current.get('resume_on_boot')) != bool(resume_on_boot)
+                    or current.get('restore_temporary_hold_id') != restore_temporary):
                 return result('blocked', 'Another lifecycle operation is pending.',
                               operation_id=current.get('id'), recoverable=True), 2
             operation_id = current['id']
@@ -1167,6 +1251,9 @@ def control_command(service, action, timeout):
             status = observed.get('status', 'pending')
             if status == 'complete':
                 details = {'operation_id': current['id']}
+                for key in ('temporary_hold_id', 'temporary_hold_services', 'restored_temporary_hold_id'):
+                    if key in observed:
+                        details[key] = observed[key]
                 return result('complete', observed.get('message', 'Lifecycle operation completed.'),
                               **details), 0
             return result('pending', observed.get('message', 'Lifecycle operation is still pending.'),
@@ -1175,6 +1262,10 @@ def control_command(service, action, timeout):
         operation_id = request_id
         request = {'id': request_id, 'service': service, 'action': action,
                    'created_at': time.time(), 'expires_at': time.time() + timeout}
+        if resume_on_boot:
+            request['resume_on_boot'] = True
+        if restore_temporary:
+            request['restore_temporary'] = restore_temporary
         request_path = state_dir / 'control-request.json'
         if request_path.exists() or (state_dir / 'control-inflight.json').exists():
             return result('blocked', 'A previous control request has not been reconciled.'), 2
@@ -1195,6 +1286,9 @@ def control_command(service, action, timeout):
             return result('pending', observed['message'], operation_id=request_id, recoverable=True), 2
         if observed.get('status') == 'complete':
             details = {'operation_id': request_id}
+            for key in ('temporary_hold_id', 'temporary_hold_services', 'restored_temporary_hold_id'):
+                if key in observed:
+                    details[key] = observed[key]
             return result('complete', observed.get('message', 'Lifecycle operation completed.'),
                           **details), 0
         return result('blocked', observed.get('message', 'Lifecycle operation was blocked.'),
@@ -1434,6 +1528,7 @@ def supervise():
     signal.signal(signal.SIGTERM, stop_signal)
     signal.signal(signal.SIGINT, stop_signal)
     try:
+        reconcile_resume_on_boot(load_lifecycle())
         while not stopping:
             try:
                 if (ROOT / 'state/maintenance').exists():
@@ -1526,7 +1621,8 @@ def supervise():
                          "workers": {n: p.pid for n, (p, _) in children.items() if n in ("settings-backup",)},
                          "services": lifecycle_service_status(app_names, children, endpoints, lifecycle, restart_after),
                          "intentional_stops": sorted(held_targets),
-                         "control_operation": operation or lifecycle.get('last_result')}
+                         "control_operation": operation or lifecycle.get('last_result'),
+                         "resume_on_boot_hold": lifecycle.get('resume_on_boot')}
             except (RuntimeError, OSError, ValueError, KeyError, subprocess.TimeoutExpired) as exc:
                 lifecycle = load_lifecycle()
                 operation = lifecycle.get('operation')
@@ -1552,7 +1648,8 @@ def supervise():
                          "supervisor_pid": os.getpid(), "apps": {n: p.pid for n, (p, _) in children.items() if n in MEDIA_SERVICE_IDS},
                          "services": lifecycle_service_status(set(MEDIA_SERVICE_IDS), children, {}, lifecycle, restart_after),
                          "intentional_stops": sorted(set(lifecycle.get('service_stops', [])) | set(lifecycle.get('media_stops', []))),
-                         "control_operation": operation or lifecycle.get('last_result')}
+                         "control_operation": operation or lifecycle.get('last_result'),
+                         "resume_on_boot_hold": lifecycle.get('resume_on_boot')}
             if message != last_message:
                 print(message, flush=True); last_message = message
             state["checked_at"] = time.time()
@@ -1741,7 +1838,13 @@ def main():
     parser.add_argument("--service", choices=('media', *MEDIA_SERVICE_IDS), help="Lifecycle target for control")
     parser.add_argument("--action", choices=('start', 'stop', 'restart'), help="Lifecycle action for control")
     parser.add_argument("--timeout", type=int, default=120, help="Control wait limit in seconds (default: 120)")
+    parser.add_argument("--resume-on-boot", action="store_true",
+                        help="For media stop only: release this operation's hold after an actual macOS reboot")
+    parser.add_argument("--restore-temporary", metavar="HOLD_ID",
+                        help="For media start only: undo only the temporary hold returned by media stop")
     args = parser.parse_args()
+    if args.command != 'control' and (args.resume_on_boot or args.restore_temporary):
+        parser.error('--resume-on-boot and --restore-temporary are available only for control')
     if args.command in ('stage', 'headless', 'solver'):
         require_stopped()
     if args.command == 'stage':
@@ -1791,7 +1894,9 @@ def main():
                       'action': args.action, 'message': 'Control requires --service and --action.'}
             print(json.dumps(result, separators=(',', ':')))
             raise SystemExit(2)
-        result, exit_code = control_command(args.service, args.action, args.timeout)
+        result, exit_code = control_command(args.service, args.action, args.timeout,
+                                            resume_on_boot=args.resume_on_boot,
+                                            restore_temporary=args.restore_temporary)
         print(json.dumps(result, separators=(',', ':')))
         if exit_code:
             raise SystemExit(exit_code)
@@ -1808,6 +1913,7 @@ def main():
             state['intentional_stops'] = sorted(
                 set(lifecycle.get('service_stops', [])) | set(lifecycle.get('media_stops', [])))
             state['control_operation'] = lifecycle.get('operation') or lifecycle.get('last_result')
+            state['resume_on_boot_hold'] = lifecycle.get('resume_on_boot')
         except (OSError, ValueError, RuntimeError):
             pass
         state['job_loaded'] = launchctl('print', job_domain() + '/' + LABEL, capture_output=True).returncode == 0

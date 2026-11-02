@@ -344,5 +344,68 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(children, {})
 
 
+    def test_temporary_hold_releases_only_new_group_holds_after_real_boot(self):
+        lifecycle = {
+            'service_stops': ['sonarr'],
+            'media_stops': ['radarr', 'bazarr', 'jellyfin'],
+            'resume_on_boot': {'id': 'host-op', 'boot_id': 'boot-A',
+                               'created_holds': ['jellyfin', 'qbittorrent']},
+        }
+        self.assertFalse(m.reconcile_resume_on_boot(lifecycle, 'boot-A'))
+        self.assertIn('jellyfin', lifecycle['media_stops'])
+        self.assertTrue(m.reconcile_resume_on_boot(lifecycle, 'boot-B'))
+        self.assertEqual(lifecycle['media_stops'], ['bazarr', 'radarr'])
+        self.assertEqual(lifecycle['service_stops'], ['sonarr'])
+        self.assertIsNone(lifecycle['resume_on_boot'])
+
+    def test_temporary_boot_marker_is_created_only_after_stop_completion(self):
+        lifecycle = {'service_stops': ['sonarr'], 'media_stops': ['radarr'],
+                     'operation': None, 'resume_on_boot': None}
+        request = {'id': 'host-op', 'service': 'media', 'action': 'stop',
+                   'resume_on_boot': True, 'created_at': time.time(),
+                   'expires_at': time.time() + 60}
+        with patch.object(m, 'host_boot_id', return_value='boot-A'), \
+                patch.object(m, 'require_arr_idle'), patch.object(m, 'backup_is_active', return_value=False):
+            guard = m.accept_control_request(request, lifecycle, set(m.MEDIA_SERVICE_IDS), 123)
+        self.assertIsNotNone(guard)
+        try:
+            saved = m.load_lifecycle()
+            self.assertIsNone(saved['resume_on_boot'])
+            self.assertEqual(set(saved['operation']['temporary_created_holds']),
+                             set(m.MEDIA_SERVICE_IDS) - {'sonarr', 'radarr'})
+            m.finish_control_operation(saved, saved['operation'], guard, 'All target apps stopped.')
+            marker = m.load_lifecycle()['resume_on_boot']
+            self.assertEqual(marker['id'], 'host-op')
+            self.assertEqual(marker['boot_id'], 'boot-A')
+            self.assertEqual(set(marker['created_holds']), set(m.MEDIA_SERVICE_IDS) - {'sonarr', 'radarr'})
+        finally:
+            m.release_operation_guard(guard)
+
+    def test_temporary_hold_rollback_restores_only_operation_created_apps(self):
+        lifecycle = {
+            'service_stops': ['sonarr'],
+            'media_stops': ['bazarr', 'radarr', 'jellyfin'],
+            'resume_on_boot': {'id': 'host-op', 'boot_id': 'boot-A',
+                               'created_holds': ['radarr', 'jellyfin']},
+            'operation': None,
+        }
+        request = {'id': 'rollback-op', 'service': 'media', 'action': 'start',
+                   'restore_temporary': 'host-op', 'created_at': time.time(),
+                   'expires_at': time.time() + 60}
+        guard = m.accept_control_request(request, lifecycle, set(m.MEDIA_SERVICE_IDS), 123)
+        self.assertIsNotNone(guard)
+        try:
+            saved = m.load_lifecycle()
+            self.assertEqual(saved['media_stops'], ['bazarr'])
+            self.assertEqual(set(saved['operation']['start_targets']), {'radarr', 'jellyfin'})
+            self.assertIsNone(saved['resume_on_boot'])
+            result = m.finish_control_operation(saved, saved['operation'], guard,
+                                                'Temporary hold rollback completed.')
+            self.assertIsNone(result)
+            self.assertEqual(saved['last_result']['restored_temporary_hold_id'], 'host-op')
+        finally:
+            m.release_operation_guard(guard)
+
+
 if __name__ == '__main__':
     unittest.main()

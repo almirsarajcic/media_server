@@ -103,3 +103,9 @@ With the system supervisor running and storage verified, submit a scoped request
 Targets are `media` or one of `jellyfin`, `sonarr`, `radarr`, `jackett`, `bazarr`, `qbittorrent`, and `flaresolverr`; actions are `start`, `stop`, and `restart`. A media group start retains separately held individual services. Holds persist in private lifecycle state. Control waits for graceful exits and checks Arr activity before stopping; backups and lifecycle operations exclude each other. A pending result is not success: inspect `status`, resolve the ongoing operation, and repeat the same request to observe its result. It does not force-kill an operation merely because the client timed out. A verified storage failure remains an emergency gate and stops the owned stack.
 
 The separate `stop` command still establishes whole-stack maintenance, and `start` resumes that maintenance workflow. Check status and service endpoints after any action; local tests do not establish live runtime health.
+
+## Temporary media hold across a host restart
+
+For a coordinated host restart, `control --service media --action stop --resume-on-boot` creates a temporary group hold after the graceful stop completes. Record the returned temporary hold ID. Restarting only the supervisor on the same boot does not clear it; a new macOS boot clears only the holds created by that operation, preserving earlier individual and group holds. This command controls media services and does not itself restart or power off the host.
+
+If the host restart is cancelled, use `control --service media --action start --restore-temporary HOLD_ID`, replacing the placeholder with the returned ID. The exact ID prevents a stale rollback from releasing another hold. Inspect `status` and endpoint readiness after recovery. A pending or blocked result requires investigation; do not assume a timeout means the hold completed.
