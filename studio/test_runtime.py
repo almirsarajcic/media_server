@@ -27,6 +27,15 @@ class RuntimeTests(unittest.TestCase):
         self.patcher.stop()
         self.temp.cleanup()
 
+    def test_regenerated_proxy_keeps_site_import_and_media_policy(self):
+        state = m.ROOT / 'state'
+        state.mkdir(parents=True)
+        (state / 'home-access.json').write_text(json.dumps({'management_networks': ['192.168.1.0/24']}))
+        config = m.proxy_config()
+        self.assertIn('import proxy-sites/*.caddy', config)
+        self.assertIn('http://jellyfin.local', config)
+        self.assertIn('not remote_ip 127.0.0.1 ::1 192.168.1.0/24', config)
+
     def test_library_refresh_waits_for_ids_and_options_after_rename(self):
         unresolved = {'Locations': [str(m.ROOT/'media/movies')], 'Name': 'Movies'}
         resolved = dict(unresolved, ItemId='new-id', LibraryOptions={'EnableRealtimeMonitor': True})

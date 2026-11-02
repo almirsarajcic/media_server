@@ -614,7 +614,7 @@ def proxy_config():
             gate = '\t@outside not remote_ip 127.0.0.1 ::1 ' + ' '.join(networks) + '\n'
             gate += '\trespond @outside "Home network only" 403\n'
         blocks.append(f'http://{name}.local {{\n{gate}\treverse_proxy 127.0.0.1:{port}\n}}\n')
-    return "{\n\tadmin off\n\tauto_https off\n}\n\n" + '\n'.join(blocks)
+    return "{\n\tadmin off\n\tauto_https off\n}\n\n" + '\n'.join(blocks) + '\nimport proxy-sites/*.caddy\n'
 
 
 def home_network(value):

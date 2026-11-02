@@ -85,3 +85,7 @@ Completion requires password-free app content from the home LAN, explicit denial
 ## Import notifications
 
 [Downloads appearing in Jellyfin](imports.md) owns Radarr/Sonarr import notifications, native movie identity sidecars and discovery troubleshooting.
+
+## Additional proxy sites
+
+Generated Caddy configuration imports `proxy-sites/*.caddy` under the runtime root, preserving separately maintained site definitions when media configuration is regenerated. Keep those definitions and their access policies under their own owners; the media LAN policy remains in the generated media blocks.
