@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1240" height="1240" viewBox="0 0 1240 1240" role="img" aria-labelledby="title desc">
+<title id="title">Local network access</title><desc id="desc">Six home network addresses route through Caddy to corresponding loopback services on Mac Studio.</desc>
+<defs><marker id="arrow" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L9,4.5 L0,9 Z" fill="#64748b"/></marker></defs>
+<rect width="1240" height="1240" fill="white"/>
+<g font-family="-apple-system,BlinkMacSystemFont,Arial,sans-serif" fill="#172033">
+<text x="40" y="45" font-size="23" font-weight="700">Home network addresses</text>
+<text x="440" y="45" font-size="23" font-weight="700">Caddy · Mac Studio · HTTP 80</text>
+<text x="855" y="45" font-size="23" font-weight="700">Mac Studio · loopback services</text>
+<rect x="425" y="82" width="315" height="525" rx="16" fill="#f8fafc" stroke="#cbd5e1" stroke-width="2"/>
+<rect x="840" y="82" width="365" height="525" rx="16" fill="#f8fafc" stroke="#cbd5e1" stroke-width="2"/>
+<rect x="35" y="108" width="290" height="56" rx="9" fill="#eef5ff" stroke="#bad1ed"/><text x="52" y="143" font-size="21">http://jellyfin.local</text>
+<path d="M325 136 H445" fill="none" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="450" y="108" width="265" height="56" rx="9" fill="white" stroke="#cbd5e1"/><text x="468" y="143" font-size="21">jellyfin.local</text>
+<path d="M715 136 H860" fill="none" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="865" y="108" width="315" height="56" rx="9" fill="white" stroke="#cbd5e1"/><text x="882" y="143" font-size="19">Jellyfin · 127.0.0.1:8096</text>
+<rect x="35" y="188" width="290" height="56" rx="9" fill="#eef5ff" stroke="#bad1ed"/><text x="52" y="223" font-size="21">http://sonarr.local</text>
+<path d="M325 216 H445" fill="none" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="450" y="188" width="265" height="56" rx="9" fill="white" stroke="#cbd5e1"/><text x="468" y="223" font-size="21">sonarr.local</text>
+<path d="M715 216 H860" fill="none" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="865" y="188" width="315" height="56" rx="9" fill="white" stroke="#cbd5e1"/><text x="882" y="223" font-size="19">Sonarr · 127.0.0.1:8989</text>
+<rect x="35" y="268" width="290" height="56" rx="9" fill="#eef5ff" stroke="#bad1ed"/><text x="52" y="303" font-size="21">http://radarr.local</text>
+<path d="M325 296 H445" fill="none" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="450" y="268" width="265" height="56" rx="9" fill="white" stroke="#cbd5e1"/><text x="468" y="303" font-size="21">radarr.local</text>
+<path d="M715 296 H860" fill="none" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="865" y="268" width="315" height="56" rx="9" fill="white" stroke="#cbd5e1"/><text x="882" y="303" font-size="19">Radarr · 127.0.0.1:7878</text>
+<rect x="35" y="348" width="290" height="56" rx="9" fill="#eef5ff" stroke="#bad1ed"/><text x="52" y="383" font-size="21">http://jackett.local</text>
+<path d="M325 376 H445" fill="none" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="450" y="348" width="265" height="56" rx="9" fill="white" stroke="#cbd5e1"/><text x="468" y="383" font-size="21">jackett.local</text>
+<path d="M715 376 H860" fill="none" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="865" y="348" width="315" height="56" rx="9" fill="white" stroke="#cbd5e1"/><text x="882" y="383" font-size="19">Jackett · 127.0.0.1:9117</text>
+<rect x="35" y="428" width="290" height="56" rx="9" fill="#eef5ff" stroke="#bad1ed"/><text x="52" y="463" font-size="21">http://bazarr.local</text>
+<path d="M325 456 H445" fill="none" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="450" y="428" width="265" height="56" rx="9" fill="white" stroke="#cbd5e1"/><text x="468" y="463" font-size="21">bazarr.local</text>
+<path d="M715 456 H860" fill="none" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="865" y="428" width="315" height="56" rx="9" fill="white" stroke="#cbd5e1"/><text x="882" y="463" font-size="19">Bazarr · 127.0.0.1:6767</text>
+<rect x="35" y="508" width="290" height="56" rx="9" fill="#eef5ff" stroke="#bad1ed"/><text x="52" y="543" font-size="21">http://qbittorrent.local</text>
+<path d="M325 536 H445" fill="none" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="450" y="508" width="265" height="56" rx="9" fill="white" stroke="#cbd5e1"/><text x="468" y="543" font-size="21">qbittorrent.local</text>
+<path d="M715 536 H860" fill="none" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="865" y="508" width="315" height="56" rx="9" fill="white" stroke="#cbd5e1"/><text x="882" y="543" font-size="19">qBittorrent · 127.0.0.1:8080</text>
+</g></svg>
