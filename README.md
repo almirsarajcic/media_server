@@ -12,6 +12,7 @@ This repository maintains an existing, host-specific installation. It is not a t
 - [Downloads appearing in Jellyfin](docs/imports.md): import notifications, movie identity and refresh checks.
 - [English subtitles](docs/subtitles.md): automatic English downloads and Jellyfin playback defaults.
 - [Verification and limits](docs/verification.md): automated checks, observed live behavior and outstanding tests.
+- [Apple TV playback](docs/apple-tv-playback.md): tested Swiftfin settings and their verification limits.
 - [Controller](studio/media-server), [storage/startup tests](studio/test_storage_gate.py), [migration tests](studio/test_migration.py) and [runtime tests](studio/test_runtime.py).
 
 ## Services
