@@ -437,6 +437,261 @@ def restore_original_logins():
     print('Original Sonarr and Radarr login records restored; native API keys unchanged')
 
 
+# FlareSolverr browser recovery runs in its service process, never in the supervisor.
+def solver_pair_version(browser, driver):
+    import re
+    versions = []
+    for executable in (browser, driver):
+        result = subprocess.run([executable, '--version'], capture_output=True, text=True, timeout=10, check=True)
+        match = re.search(r'\b(\d+\.\d+\.\d+\.\d+)\b', result.stdout)
+        if not match:
+            raise RuntimeError('Browser or driver did not report a version')
+        versions.append(match.group(1))
+    if versions[0] != versions[1]:
+        raise RuntimeError('Browser and driver versions differ: ' + ' / '.join(versions))
+    return versions[0]
+
+
+def solver_stable_metadata():
+    import re, urllib.request
+    url = 'https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json'
+    with urllib.request.urlopen(url, timeout=20) as response:
+        raw = response.read(1024 * 1024 + 1)
+    if len(raw) > 1024 * 1024:
+        raise RuntimeError('Chrome metadata exceeded size limit')
+    stable = json.loads(raw)['channels']['Stable']
+    version = stable['version']
+    if not re.fullmatch(r'\d+\.\d+\.\d+\.\d+', version):
+        raise RuntimeError('Invalid Chrome for Testing version')
+    urls = {}
+    for name in ('chrome', 'chromedriver'):
+        matches = [x['url'] for x in stable['downloads'][name] if x['platform'] == 'mac-arm64']
+        expected = f'https://storage.googleapis.com/chrome-for-testing-public/{version}/mac-arm64/{name}-mac-arm64.zip'
+        if matches != [expected]:
+            raise RuntimeError('Unexpected Chrome for Testing download URL')
+        urls[name] = expected
+    return version, urls
+
+
+def solver_provision():
+    import shutil, tempfile, zipfile
+    version, urls = solver_stable_metadata()
+    parent = ROOT / 'apps/flaresolverr-pairs'
+    parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    stage = pathlib.Path(tempfile.mkdtemp(prefix='.stage-', dir=parent))
+    try:
+        hashes = {}
+        for name, url in urls.items():
+            archive = stage / (name + '.zip')
+            subprocess.run(['curl', '--fail', '--silent', '--show-error', '--location', '--proto', '=https',
+                            '--proto-redir', '=https', '--connect-timeout', '20', '--max-time', '240',
+                            '--max-filesize', str(600 * 1024 * 1024), '--output', str(archive), url], check=True, timeout=250)
+            with archive.open('rb') as f:
+                hashes[name] = hashlib.file_digest(f, 'sha256').hexdigest()
+            with zipfile.ZipFile(archive) as z:
+                for item in z.infolist():
+                    p = pathlib.PurePosixPath(item.filename)
+                    if p.is_absolute() or '..' in p.parts:
+                        raise RuntimeError('Unsafe path in Chrome archive')
+                if sum(item.file_size for item in z.infolist()) > 1500 * 1024 * 1024:
+                    raise RuntimeError('Chrome archive exceeds extraction limit')
+                if z.testzip() is not None:
+                    raise RuntimeError('Chrome archive checksum failed')
+            subprocess.run(['ditto', '-x', '-k', str(archive), str(stage)], check=True, timeout=120)
+            archive.unlink()
+        browser = stage / 'chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing'
+        driver = stage / 'chromedriver-mac-arm64/chromedriver'
+        if solver_pair_version(str(browser), str(driver)) != version:
+            raise RuntimeError('Downloaded browser pair does not match metadata')
+        source = ROOT / 'apps/FlareSolverr'
+        venv = ROOT / 'apps/flaresolverr-venv/bin/python'
+        env = dict(os.environ, PYTHONPATH=str(source / 'src'))
+        subprocess.run([str(venv), '-c', 'import sys; from undetected_chromedriver.patcher import Patcher; Patcher(executable_path=sys.argv[1]).auto()', str(driver)], env=env, check=True, timeout=30)
+        subprocess.run(['codesign', '--force', '--sign', '-', str(driver)], check=True, timeout=30)
+        subprocess.run(['codesign', '--verify', '--strict', str(driver)], check=True, timeout=30)
+        with browser.open('rb') as f: browser_hash = hashlib.file_digest(f, 'sha256').hexdigest()
+        with driver.open('rb') as f: driver_hash = hashlib.file_digest(f, 'sha256').hexdigest()
+        save_json(stage / 'receipt.json', {'version': version, 'urls': urls, 'archive_sha256': hashes,
+                  'browser_sha256': browser_hash, 'patched_driver_sha256': driver_hash}, private=True)
+        # Unique versioned candidate; an existing working pair is never overwritten.
+        final = parent / (version + '-' + uuid.uuid4().hex[:12])
+        stage.rename(final)
+        return {'browser': str(final / browser.relative_to(stage)), 'driver': str(final / driver.relative_to(stage)), 'version': version}
+    except BaseException:
+        shutil.rmtree(stage, ignore_errors=True)
+        raise
+
+
+def solver_cleanup(keep):
+    """Remove only guard-owned staging and candidates; never touch legacy installs."""
+    import shutil
+    parent = ROOT / 'apps/flaresolverr-pairs'
+    if not parent.exists():
+        return
+    keep_dirs = set()
+    for pair in keep:
+        if not pair or not pair.get('browser'):
+            continue
+        try:
+            keep_dirs.add(pathlib.Path(pair['browser']).relative_to(parent).parts[0])
+        except (ValueError, IndexError):
+            pass
+    for item in parent.iterdir():
+        if item.name not in keep_dirs and item.is_dir() and not item.is_symlink():
+            shutil.rmtree(item)
+
+
+def solver_cooldown(failures):
+    return min(21600, 300 * 2 ** min(max(failures - 1, 0), 7))
+
+
+def solver_failure_state(state, candidate, error, now):
+    failures = min(int(state.get('failures', 0)) + 1, 1000)
+    last = state.get('last_working')
+    rollback = state.get('rollback')
+    failed_browser = candidate.get('browser')
+    if last and failed_browser != last.get('browser') and (not rollback or failed_browser != rollback.get('browser')):
+        provision_next, try_rollback = False, False
+    elif last and rollback and failed_browser == last.get('browser') and rollback.get('browser') != failed_browser:
+        provision_next, try_rollback = False, True
+    else:
+        provision_next, try_rollback = True, False
+    if str(error) == 'Solver port is already occupied':
+        provision_next, try_rollback = False, False
+    state.update(status='cooldown', message=str(error)[:500], failures=failures,
+                 provision_next=provision_next, try_rollback=try_rollback,
+                 retry_at=now + solver_cooldown(failures))
+    return state
+
+
+def solver_local_ready(port):
+    import urllib.request
+    try:
+        with urllib.request.urlopen('http://127.0.0.1:' + str(port) + '/', timeout=1) as response:
+            body = json.loads(response.read(4096))
+        return isinstance(body, dict) and body.get('msg') == 'FlareSolverr is ready!'
+    except (OSError, ValueError):
+        return False
+
+
+def solver_load_state(path):
+    import math
+    if not path.exists():
+        return {}
+    try:
+        state = json.loads(path.read_text())
+        if not isinstance(state, dict):
+            raise ValueError('state is not an object')
+        for key in ('last_working', 'rollback'):
+            pair = state.get(key)
+            if pair is None:
+                continue
+            if not isinstance(pair, dict):
+                raise ValueError('invalid pair')
+            for field in ('browser', 'driver'):
+                value = pair.get(field)
+                if not isinstance(value, str) or not value or '\x00' in value:
+                    raise ValueError('invalid pair path')
+                path_value = pathlib.Path(value)
+                if not path_value.is_absolute() or not path_value.is_relative_to(ROOT / 'apps') or '..' in path_value.parts:
+                    raise ValueError('pair path outside private apps')
+        retry = state.get('retry_at', 0)
+        if isinstance(retry, bool) or not isinstance(retry, (int, float)) or not math.isfinite(retry) or retry < 0 or retry > time.time() + 21660:
+            raise ValueError('invalid retry time')
+        failures = state.get('failures', 0)
+        if isinstance(failures, bool) or not isinstance(failures, int) or not 0 <= failures <= 1000:
+            raise ValueError('invalid failure count')
+        for key in ('provision_next', 'try_rollback'):
+            if key in state and not isinstance(state[key], bool):
+                raise ValueError('invalid recovery flag')
+        return state
+    except (OSError, ValueError, TypeError):
+        return {'status': 'cooldown', 'message': 'Invalid recovery state; retrying selected pair after cooldown',
+                'failures': 1, 'retry_at': time.time() + 300, 'provision_next': False, 'state_invalid': True}
+
+
+def solver_guard():
+    """Keep Solver local, retry failures slowly, and never disturb another service."""
+    if os.getpgrp() != os.getpid():
+        raise RuntimeError('Solver guard must run as its own process group leader')
+    state_path = ROOT / 'state/flaresolverr-recovery.json'
+    state = solver_load_state(state_path)
+    candidate = {'browser': os.environ.get('FLARESOLVERR_BROWSER_PATH', ''),
+                 'driver': os.environ.get('FLARESOLVERR_DRIVER_PATH', '')}
+    source = ROOT / 'apps/FlareSolverr'
+    venv = ROOT / 'apps/flaresolverr-venv/bin/python'
+    if not state.get('state_invalid'):
+        solver_cleanup([state.get('last_working'), state.get('rollback')])
+    save_json(state_path, state, private=True)
+    def stop_group(_signum, _frame):
+        # The helper holds this process group alive while descendants receive TERM,
+        # then bounds shutdown even if one ignores TERM. It cannot target a reused group.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        cleaner = os.fork()
+        if cleaner == 0:
+            try:
+                os.killpg(os.getpgrp(), signal.SIGTERM)
+                time.sleep(5)
+                os.killpg(os.getpgrp(), signal.SIGKILL)
+            finally:
+                os._exit(0)
+        raise SystemExit(0)
+    signal.signal(signal.SIGTERM, stop_group)
+    signal.signal(signal.SIGINT, stop_group)
+    child = None
+    while True:
+        remaining = float(state.get('retry_at', 0)) - time.time()
+        if remaining > 0:
+            time.sleep(min(remaining, 30)); continue
+        try:
+            if state.get('provision_next'):
+                state.update(status='provisioning', message='Downloading a matched Chrome for Testing pair')
+                save_json(state_path, state, private=True)
+                candidate = solver_provision()
+            else:
+                candidate = (state.get('rollback') if state.get('try_rollback') else state.get('last_working')) or candidate
+            version = solver_pair_version(candidate['browser'], candidate['driver'])
+            env = dict(os.environ, FLARESOLVERR_BROWSER_PATH=candidate['browser'], FLARESOLVERR_DRIVER_PATH=candidate['driver'])
+            state.update(status='starting', message='Testing the local Solver startup', retry_at=0)
+            save_json(state_path, state, private=True)
+            # The Solver and browser remain in the supervisor-owned service group.
+            port = int(env.get('PORT', '8191'))
+            with socket.socket() as probe:
+                if probe.connect_ex(('127.0.0.1', port)) == 0:
+                    raise RuntimeError('Solver port is already occupied')
+            child = subprocess.Popen([str(venv), '-u', str(source / 'src/flaresolverr.py')], cwd=source, env=env)
+            deadline = time.monotonic() + 60
+            while child.poll() is None and time.monotonic() < deadline:
+                if child.poll() is None and solver_local_ready(port):
+                    break
+                time.sleep(1)
+            else:
+                raise RuntimeError('Solver startup self-test failed')
+            state.pop('state_invalid', None)
+            previous = state.get('last_working')
+            if previous and previous.get('browser') != candidate['browser']:
+                state['rollback'] = previous
+            state.update(status='healthy', message='Solver startup self-test passed', last_working={**candidate, 'version': version}, provision_next=False, try_rollback=False, retry_at=0)
+            save_json(state_path, state, private=True)
+            solver_cleanup([state.get('last_working'), state.get('rollback')])
+            start = time.monotonic()
+            child.wait()
+            if time.monotonic() - start >= 300:
+                state['failures'] = 0
+            raise RuntimeError('Solver exited unexpectedly')
+        except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as exc:
+            solver_failure_state(state, candidate, exc, time.time())
+            save_json(state_path, state, private=True)
+            if child is None and not state.get('state_invalid'):
+                solver_cleanup([state.get('last_working'), state.get('rollback')])
+            print('FlareSolverr recovery waiting: ' + state['message'], flush=True)
+            if child is not None:
+                # Kill the entire owned group, including surviving Chrome descendants.
+                # The supervisor restarts the guard; its persisted cooldown prevents a storm.
+                stop_group(signal.SIGTERM, None)
+
+
 def install_solver():
     """Pinned upstream source with scoped native macOS headless adjustments."""
     source = ROOT / 'apps/FlareSolverr'
@@ -452,28 +707,12 @@ def install_solver():
     if cached_selenium.exists():
         subprocess.run([str(venv / 'bin/python'), '-m', 'pip', 'install', '--no-deps', str(cached_selenium)], check=True)
     subprocess.run([str(venv / 'bin/python'), '-m', 'pip', 'install', '--find-links', str(ROOT / 'wheels/solver'), '-r', str(source / 'requirements.txt')], check=True)
+    # Preserve a configured pair; the guard provisions a fresh matched pair on failure.
+    previous = json.loads((ROOT / 'state/services.json').read_text()).get('flaresolverr', {})
+    old_env = previous.get('environment', {})
     browser = ROOT / 'apps/flaresolverr-browser'
-    chrome = browser / 'Google Chrome.app/Contents/MacOS/Google Chrome'
-    driver = browser / 'chromedriver-mac-arm64/chromedriver'
-    browser.mkdir(exist_ok=True)
-    if not chrome.exists():
-        installed = pathlib.Path('/Applications/Google Chrome.app')
-        version = plistlib.loads((installed / 'Contents/Info.plist').read_bytes())['CFBundleShortVersionString']
-        if version != '155.0.8059.40': raise RuntimeError('Qualify a matching managed browser/driver version before installation')
-        subprocess.run(['/bin/cp', '-cR', str(installed), str(browser / 'Google Chrome.app')], check=True)
-    if not driver.exists():
-        archive = ROOT / 'installers/solver-chromedriver.zip'
-        subprocess.run(['curl', '--fail', '--silent', '--show-error', '-C', '-', '-o', str(archive),
-            'https://storage.googleapis.com/chrome-for-testing-public/155.0.8059.79/mac-arm64/chromedriver-mac-arm64.zip'], check=True)
-        subprocess.run(['ditto', '-x', '-k', str(archive), str(browser)], check=True)
-    # Upstream patches the driver binary. macOS requires a fresh signature after
-    # that patch; otherwise the kernel kills the driver at launch with signal 9.
-    env = dict(os.environ, PYTHONPATH=str(source / 'src'))
-    subprocess.run([str(venv / 'bin/python'), '-c',
-        'import sys; from undetected_chromedriver.patcher import Patcher; Patcher(executable_path=sys.argv[1]).auto()',
-        str(driver)], env=env, check=True)
-    subprocess.run(['codesign', '--force', '--sign', '-', str(driver)], check=True)
-    subprocess.run(['codesign', '--verify', '--strict', str(driver)], check=True)
+    chrome = old_env.get('FLARESOLVERR_BROWSER_PATH', str(browser / 'Google Chrome.app/Contents/MacOS/Google Chrome'))
+    driver = old_env.get('FLARESOLVERR_DRIVER_PATH', str(browser / 'chromedriver-mac-arm64/chromedriver'))
     # The upstream Linux/Xvfb branch cannot run in a macOS boot daemon.
     utils = source / 'src/utils.py'
     text = subprocess.check_output(['git', '-C', str(source), 'show', commit + ':src/utils.py']).decode()
@@ -485,7 +724,7 @@ def install_solver():
                         "    if os.environ.get('FLARESOLVERR_BROWSER_PATH'):\n        return os.environ['FLARESOLVERR_BROWSER_PATH']\n    if CHROME_EXE_PATH is not None:")
     utils.write_text(text)
     config = json.loads((ROOT / 'state/services.json').read_text())
-    config['flaresolverr'] = {'command': [str(venv / 'bin/python'), '-u', str(source / 'src/flaresolverr.py')],
+    config['flaresolverr'] = {'command': [PYTHON, str(SCRIPT), 'solver-guard'],
         'cwd': str(source), 'environment': {'HOST': '127.0.0.1', 'PORT': '8191', 'HEADLESS': 'true',
         'TZ': 'Africa/Nairobi', 'LOG_LEVEL': 'info', 'LOG_HTML': 'false',
         'FLARESOLVERR_BROWSER_PATH': str(chrome), 'FLARESOLVERR_DRIVER_PATH': str(driver)}}
@@ -1832,7 +2071,7 @@ def stop_supervisor():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["packages", "stage", "start", "stop", "run", "check", "status", "storage", "verify", "mdns", "proxy", "headless", "prepare-boot", "backup", "backup-loop", "import-configs", "test-recovery", "solver", "acquisition", "restore-logins", "home-access", "control"])
+    parser.add_argument("command", choices=["packages", "stage", "start", "stop", "run", "check", "status", "storage", "verify", "mdns", "proxy", "headless", "prepare-boot", "backup", "backup-loop", "import-configs", "test-recovery", "solver", "acquisition", "restore-logins", "home-access", "control", "solver-guard"])
     parser.add_argument("--uuid")
     parser.add_argument("--mountpoint")
     parser.add_argument("--media-root")
@@ -1865,6 +2104,8 @@ def main():
         install_headless()
     elif args.command == 'solver':
         install_solver()
+    elif args.command == 'solver-guard':
+        solver_guard()
     elif args.command == 'acquisition':
         activate_acquisition()
     elif args.command == 'prepare-boot':
@@ -1920,6 +2161,10 @@ def main():
             state['resume_on_boot_hold'] = lifecycle.get('resume_on_boot')
         except (OSError, ValueError, RuntimeError):
             pass
+        recovery = ROOT / 'state/flaresolverr-recovery.json'
+        if recovery.exists():
+            with contextlib.suppress(OSError, ValueError):
+                state['flaresolverr_recovery'] = json.loads(recovery.read_text())
         state['job_loaded'] = launchctl('print', job_domain() + '/' + LABEL, capture_output=True).returncode == 0
         state['job_domain'] = job_domain()
         if state.get('phase') in ('running', 'degraded', 'maintenance', 'blocked') and (not state['job_loaded'] or time.time() - state.get('checked_at', 0) > 90):

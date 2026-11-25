@@ -67,7 +67,7 @@ Sonarr/Radarr use Jackett and qBittorrent; Bazarr connects to their APIs/event f
 - Storage failure stops the owned stack. Restoring the correct volume permits automatic recovery. Intentional maintenance stays stopped until explicitly resumed.
 - Acquisition is enabled for tested indexers and download clients. Original catalog records keep their monitoring choices; new monitored additions use the enabled pipeline. The owner removed the imported stopped torrents; verification preserves that decision.
 - Settings backups run daily on the external disk; seven completed snapshots are retained. They are separate from independent/offsite backups.
-- Normal boot does not download applications or updates. Native dependencies are installed deliberately through the controller.
+- Native dependencies are installed deliberately through the controller. If FlareSolverr fails to start, its recovery process can download and test a matched Chrome for Testing pair. Healthy starts use the working pair already on disk. See [FlareSolverr browser recovery](docs/operations.md#flaresolverr-browser-recovery).
 
 ## Folder map
 
